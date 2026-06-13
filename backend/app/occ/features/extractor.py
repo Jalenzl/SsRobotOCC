@@ -16,6 +16,7 @@ from app.occ.discretize import wire_length, wire_location_on_face, wire_to_polyl
 from app.occ.features.contour_classifier import classify_wire_contour
 from app.occ.geometry_utils import (
     face_area,
+    face_outward_normal,
     face_surface_info,
     face_wires,
     iterate_faces,
@@ -23,6 +24,30 @@ from app.occ.geometry_utils import (
     shape_bbox,
     work_plane_normal,
 )
+
+
+def _make_3d_helpers(shape, options: CadAnalyzeOptions, bbox_tuple):
+    """构建内外表面分类器与 3D 深度上下文（任一失败均回退 None，不影响 2D）。
+
+    返回 (FaceSideClassifier|None, Feature3DContext|None)。3D 能力是可选增强：
+    纯 Shell 模型或异常时返回 None，调用方据此回退到原有 2D 行为。
+    """
+    side_clf = None
+    ctx3d = None
+    try:
+        from app.occ.features.face_side import FaceSideClassifier
+
+        side_clf = FaceSideClassifier(shape)
+    except Exception:
+        side_clf = None
+    if getattr(options, "enable_depth", True):
+        try:
+            from app.occ.features.feature3d import Feature3DContext
+
+            ctx3d = Feature3DContext(shape, bbox_tuple)
+        except Exception:
+            ctx3d = None
+    return side_clf, ctx3d
 
 
 def extract_all_features(shape, options: CadAnalyzeOptions) -> dict[str, Any]:
@@ -39,6 +64,8 @@ def extract_all_features(shape, options: CadAnalyzeOptions) -> dict[str, Any]:
     contours: list[dict] = []
     contour_idx = 0
 
+    side_clf, ctx3d = _make_3d_helpers(shape, options, bbox_tuple)
+
     for face_idx, face in enumerate(iterate_faces(shape)):
         fid = f"face_{face_idx}"
         payload, contour_idx = _extract_face_payload(
@@ -47,11 +74,14 @@ def extract_all_features(shape, options: CadAnalyzeOptions) -> dict[str, Any]:
             options=options,
             wp_normal=wp_normal,
             contour_index_start=contour_idx,
+            side_clf=side_clf,
+            ctx3d=ctx3d,
         )
         polylines.extend(payload["polylines"])
         wires_out.extend(payload["wires"])
         contours.extend(payload["contours"])
         holes.extend(payload["holes"])
+        pockets.extend(payload["pockets"])
         ref_points.extend(payload["reference_points"])
         faces_out.append(payload["face"])
 
@@ -110,12 +140,15 @@ def extract_face_features(shape, options: CadAnalyzeOptions, *, face_id: str) ->
         raise ValueError(f"face_id 不存在: {face_id}")
 
     canonical_face_id = f"face_{target_index}"
+    side_clf, ctx3d = _make_3d_helpers(shape, options, bbox_tuple)
     payload, _ = _extract_face_payload(
         selected_face,
         fid=canonical_face_id,
         options=options,
         wp_normal=wp_normal,
         contour_index_start=0,
+        side_clf=side_clf,
+        ctx3d=ctx3d,
     )
 
     contours = payload["contours"]
@@ -135,8 +168,95 @@ def extract_face_features(shape, options: CadAnalyzeOptions, *, face_id: str) ->
         "contours": contours,
         "outer_contours": outer_contours,
         "holes": holes,
-        "pockets": [],
+        "pockets": payload["pockets"],
         "feature_groups": _build_feature_groups(contours=contours, holes=holes, wires=wires),
+        "work_plane": wp_mode,
+        "work_plane_normal": _vec(wp_normal),
+    }
+
+
+def extract_face_spread_features(shape, options: CadAnalyzeOptions, *, face_id: str) -> dict[str, Any]:
+    """选面 → 内/外表面扩散分析。
+
+    1. 解析种子面，用外法向正负判定其为外表面(outer)还是内表面(inner)；
+    2. 扩散：收集整个装配体中所有同侧（同为 outer 或同为 inner）的面；
+    3. 复用 ``_extract_face_payload`` 逐面提取轮廓/孔，并叠加 3D 深度识别
+       （通孔/盲孔/型腔/凸台 + 深度）；
+    4. 聚合为 ``CadFaceSpreadResult``。
+    """
+    bbox_tuple = shape_bbox(shape)
+    wp_mode = options.work_plane.value if isinstance(options.work_plane, WorkPlane) else str(options.work_plane)
+    wp_normal = work_plane_normal(wp_mode, bbox_tuple)
+
+    side_clf, ctx3d = _make_3d_helpers(shape, options, bbox_tuple)
+    if side_clf is None:
+        raise ValueError("无法构建内外表面分类器（模型可能无有效面）")
+
+    target_index = _parse_face_index(face_id)
+    faces = side_clf.faces
+    if not (0 <= target_index < len(faces)):
+        raise ValueError(f"face_id 不存在: {face_id}")
+
+    seed_info = side_clf.classify_index(target_index)
+    seed_side = seed_info["side"]
+    if seed_side not in ("outer", "inner"):
+        # 法向不可定义时退化为外表面，保证有确定行为。
+        seed_side = "outer"
+
+    same_side_faces = side_clf.faces_on_side(seed_side)
+
+    polylines: list[dict] = []
+    faces_out: list[dict] = []
+    wires_out: list[dict] = []
+    holes: list[dict] = []
+    pockets: list[dict] = []
+    ref_points: list[dict] = []
+    contours: list[dict] = []
+    face_ids: list[str] = []
+    contour_idx = 0
+
+    for face_idx, face in same_side_faces:
+        fid = f"face_{face_idx}"
+        payload, contour_idx = _extract_face_payload(
+            face,
+            fid=fid,
+            options=options,
+            wp_normal=wp_normal,
+            contour_index_start=contour_idx,
+            side_clf=side_clf,
+            ctx3d=ctx3d,
+        )
+        polylines.extend(payload["polylines"])
+        wires_out.extend(payload["wires"])
+        contours.extend(payload["contours"])
+        holes.extend(payload["holes"])
+        pockets.extend(payload["pockets"])
+        ref_points.extend(payload["reference_points"])
+        faces_out.append(payload["face"])
+        face_ids.append(fid)
+
+    holes = _dedupe_holes(holes)
+    outer_contours = _select_global_outer_contours(contours)
+    solid_count = max(1, side_clf.solid_count)
+
+    return {
+        "schema_version": "1.0",
+        "unit": "mm",
+        "target_face_id": f"face_{target_index}",
+        "side": seed_side,
+        "side_score": float(seed_info.get("score") or 0.0),
+        "model_bbox": _bbox_model(bbox_tuple),
+        "solid_count": solid_count,
+        "face_ids": face_ids,
+        "faces": faces_out,
+        "reference_points": ref_points,
+        "polylines": polylines,
+        "wires": wires_out,
+        "contours": contours,
+        "outer_contours": outer_contours,
+        "holes": holes,
+        "pockets": pockets,
+        "feature_groups": _build_feature_groups(contours=contours, holes=holes, wires=wires_out),
         "work_plane": wp_mode,
         "work_plane_normal": _vec(wp_normal),
     }
@@ -149,6 +269,8 @@ def _extract_face_payload(
     options: CadAnalyzeOptions,
     wp_normal: tuple[float, float, float],
     contour_index_start: int,
+    side_clf=None,
+    ctx3d=None,
 ) -> tuple[dict[str, Any], int]:
     surf = face_surface_info(face)
     area = face_area(face)
@@ -158,13 +280,17 @@ def _extract_face_payload(
     wires_out: list[dict] = []
     contours: list[dict] = []
     holes: list[dict] = []
+    pockets: list[dict] = []
     ref_points: list[dict] = []
+
+    # 内/外表面判定（用于扩散与 face 记录）。
+    side_info = _classify_face_side(face, side_clf)
 
     wire_infos: list[dict] = []
     surface_type = surf.get("surface_type")
     is_planar_face = surface_type == "plane"
     closure_tol = _wire_close_tol(options.linear_deflection)
-    face_normal = _face_reference_normal(surf, wp_normal)
+    face_normal = _face_reference_normal(face, surf, wp_normal)
 
     for wi, wire in enumerate(wires):
         wid = f"wire_{fid}_{wi}"
@@ -193,11 +319,12 @@ def _extract_face_payload(
                 "polyline_id": pid,
                 "pts": pts,
                 "closed": closed,
+                "wire": wire,
             }
         )
 
     if not wire_infos:
-        face_rec = _face_record(fid, surf, area, None, [])
+        face_rec = _face_record(fid, surf, area, None, [], side_info)
         return (
             {
                 "face": face_rec,
@@ -205,6 +332,7 @@ def _extract_face_payload(
                 "wires": wires_out,
                 "contours": contours,
                 "holes": holes,
+                "pockets": pockets,
                 "reference_points": ref_points,
             },
             contour_index_start,
@@ -237,7 +365,17 @@ def _extract_face_payload(
             "hexagon",
         )
         if is_inner_feature_loop:
-            _contour_to_hole(contour, fid, holes, options, ref_points)
+            _contour_to_hole(
+                contour,
+                fid,
+                holes,
+                pockets,
+                options,
+                ref_points,
+                host_face=face,
+                mouth_wire=w.get("wire"),
+                ctx3d=ctx3d,
+            )
 
         wires_out.append(
             {
@@ -286,7 +424,7 @@ def _extract_face_payload(
             contour_idx,
         )
 
-    face_rec = _face_record(fid, surf, area, outer_id, inner_ids)
+    face_rec = _face_record(fid, surf, area, outer_id, inner_ids, side_info)
     return (
         {
             "face": face_rec,
@@ -294,10 +432,22 @@ def _extract_face_payload(
             "wires": wires_out,
             "contours": contours,
             "holes": holes,
+            "pockets": pockets,
             "reference_points": ref_points,
         },
         contour_idx,
     )
+
+
+def _classify_face_side(face, side_clf) -> dict:
+    """安全调用内外表面分类器；失败时返回 unknown。"""
+    if side_clf is None:
+        return {"side": None, "score": None}
+    try:
+        info = side_clf.classify(face)
+        return {"side": info.get("side"), "score": info.get("score")}
+    except Exception:
+        return {"side": None, "score": None}
 
 
 def _select_outer_wire(wire_infos: list[dict], is_planar_face: bool) -> tuple[str, list[str]]:
@@ -501,22 +651,50 @@ def _cross(a: tuple[float, float, float], b: tuple[float, float, float]) -> tupl
     )
 
 
-def _contour_to_hole(contour: dict, face_id: str, holes: list, options, ref_points: list | None = None) -> None:
+def _contour_to_hole(
+    contour: dict,
+    face_id: str,
+    holes: list,
+    pockets: list,
+    options,
+    ref_points: list | None = None,
+    *,
+    host_face=None,
+    mouth_wire=None,
+    ctx3d=None,
+) -> None:
     ctype = contour["contour_type"]
     params = contour.get("parameters") or {}
     diam = params.get("diameter")
     if ctype == "circle" and diam is not None:
         if not (options.hole_diameter_min <= diam <= options.hole_diameter_max):
             return
+
+    # 3D 深度/类型识别（通孔/盲孔/型腔/凸台）。失败或未启用时回退 2D（depth=None）。
+    feat3d = _analyze_loop_3d(
+        ctx3d,
+        host_face=host_face,
+        mouth_wire=mouth_wire,
+        center=contour["center"],
+        normal=contour["normal"],
+        contour_type=ctype,
+    )
+    kind = feat3d["kind"] if feat3d else ctype
+    direction = feat3d["direction"] if feat3d else None
+    depth = feat3d["depth"] if feat3d else None
+    through = feat3d["through"] if feat3d else None
+
     holes.append(
         {
             "id": f"hole_{contour['id']}",
-            "kind": ctype,
+            "kind": kind,
             "contour_type": ctype,
+            "direction": direction,
+            "through": through,
             "center": contour["center"],
             "axis": contour["normal"],
             "diameter": diam,
-            "depth": None,
+            "depth": depth,
             "face_id": face_id,
             "wire_id": contour.get("wire_id"),
             "cylindrical_face_ids": [],
@@ -528,6 +706,29 @@ def _contour_to_hole(contour: dict, face_id: str, holes: list, options, ref_poin
             },
         }
     )
+
+    # 非圆凹陷（矩形/槽等）同时登记为 pocket，便于型腔加工与前端区分。
+    if feat3d and feat3d["direction"] == "recess" and ctype != "circle":
+        pockets.append(
+            {
+                "id": f"pocket_{contour['id']}",
+                "bottom_face_id": None,
+                "depth": depth or 0.0,
+                "through": through,
+                "center": contour["center"],
+                "axis": contour["normal"],
+                "contour_type": ctype,
+                "face_id": face_id,
+                "wire_ids": [contour["wire_id"]] if contour.get("wire_id") else [],
+                "parameters": {
+                    "diameter": params.get("diameter"),
+                    "length": params.get("length"),
+                    "width": params.get("width"),
+                    "across_flats": params.get("across_flats"),
+                },
+            }
+        )
+
     if ref_points is not None:
         ref_points.append(
             {
@@ -537,11 +738,32 @@ def _contour_to_hole(contour: dict, face_id: str, holes: list, options, ref_poin
                 "meta": {
                     "diameter": diam,
                     "contour_type": ctype,
+                    "kind": kind,
+                    "direction": direction,
+                    "depth": depth,
                     "contour_id": contour["id"],
                     "face_id": face_id,
                 },
             }
         )
+
+
+def _analyze_loop_3d(ctx3d, *, host_face, mouth_wire, center, normal, contour_type) -> dict | None:
+    """安全调用 Feature3DContext.analyze_loop；任何异常都回退 None。"""
+    if ctx3d is None or host_face is None:
+        return None
+    try:
+        c = (center["x"], center["y"], center["z"]) if isinstance(center, dict) else tuple(center)
+        n = (normal["x"], normal["y"], normal["z"]) if isinstance(normal, dict) else tuple(normal)
+        return ctx3d.analyze_loop(
+            host_face=host_face,
+            mouth_wire=mouth_wire,
+            center=c,
+            normal=n,
+            contour_type=contour_type,
+        )
+    except Exception:
+        return None
 
 
 def _dedupe_holes(holes: list[dict]) -> list[dict]:
@@ -557,7 +779,8 @@ def _dedupe_holes(holes: list[dict]) -> list[dict]:
     return out
 
 
-def _face_record(fid, surf, area, outer_id, inner_ids):
+def _face_record(fid, surf, area, outer_id, inner_ids, side_info: dict | None = None):
+    side_info = side_info or {}
     return {
         "id": fid,
         "surface_type": surf.get("surface_type", "other"),
@@ -569,6 +792,8 @@ def _face_record(fid, surf, area, outer_id, inner_ids):
         "bbox": None,
         "outer_wire_id": outer_id,
         "inner_wire_ids": inner_ids,
+        "side": side_info.get("side"),
+        "side_score": side_info.get("score"),
     }
 
 
@@ -588,8 +813,15 @@ def _wire_close_tol(linear_deflection: float) -> float:
     return max(1e-3, linear_deflection)
 
 
-def _face_reference_normal(surf: dict, fallback: tuple[float, float, float]) -> tuple[float, float, float]:
-    """Best available normal for contour projection on this face."""
+def _face_reference_normal(
+    face,
+    surf: dict,
+    fallback: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """宿主面外法向：优先 B-Rep 采样，其次 face_surface_info，最后加工平面兜底。"""
+    outward = face_outward_normal(face)
+    if outward is not None:
+        return outward
     n = surf.get("normal")
     if n:
         return tuple(n)

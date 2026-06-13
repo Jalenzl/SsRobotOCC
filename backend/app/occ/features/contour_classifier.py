@@ -13,6 +13,8 @@ _CIRCULARITY_SLOT_MAX = 0.9
 _SLOT_ASPECT_MIN = 1.75
 _SLOT_CIRCULARITY_MIN = 0.72
 _RECT_ASPECT_MAX = 1.6
+# 圆角矩形离散后圆度常落在 0.65–0.85；低于此值则过扁/不规则，不强行标矩形
+_RECT_CIRCULARITY_MIN = 0.55
 _HEX_CORNER_TARGET = 6
 _HEX_CORNER_TOL = 1
 _MAX_NONPLANARITY_RATIO = 0.03
@@ -32,11 +34,14 @@ def classify_wire_contour(
     """Classify a wire loop and return ContourFeature-compatible dict."""
     cid = f"contour_{contour_index}"
     normal_hint = _normalize(face_normal)
-    origin, u, v, normal, nonplanarity = _projection_basis(
+    origin, u, v, proj_normal, nonplanarity = _projection_basis(
         pts_3d,
         normal_hint,
         prefer_pca_plane=prefer_pca_plane,
     )
+    # API 输出的 contour.normal 始终为宿主面外法向（normal_hint），
+    # 不用 PCA/投影基法向，避免圆弧/自由曲面上法向「贴着邻接平面」。
+    del proj_normal  # 仅用于 2D 投影分类，不写入 JSON
 
     if is_outer:
         pts2d = np.array([_project2(p, origin, u, v) for p in pts_3d], dtype=np.float64)
@@ -47,7 +52,7 @@ def classify_wire_contour(
             cid,
             "outer",
             pts_3d,
-            normal,
+            normal_hint,
             wire_id,
             polyline_id,
             face_id,
@@ -62,7 +67,7 @@ def classify_wire_contour(
             cid,
             "unknown",
             pts_3d,
-            normal,
+            normal_hint,
             wire_id,
             polyline_id,
             face_id,
@@ -93,7 +98,7 @@ def classify_wire_contour(
         cid,
         ctype,
         pts_3d,
-        normal,
+        normal_hint,
         wire_id,
         polyline_id,
         face_id,
@@ -157,8 +162,8 @@ def _analyze_loop_2d(pts2d: np.ndarray) -> dict[str, Any]:
             "center_2d": (cx, cy),
         }
 
-    # 矩形：4 拐角或 OBB 近似直角
-    if corners in (4, 5) or (corners <= 6 and aspect <= _RECT_ASPECT_MAX and circularity < 0.82):
+    # 矩形：直角或圆角矩形（OBB 非细长、圆度未达圆孔阈值）
+    if _is_rectangle_like(corners, aspect, circularity):
         return {
             "contour_type": "rectangle",
             "parameters": {
@@ -170,8 +175,8 @@ def _analyze_loop_2d(pts2d: np.ndarray) -> dict[str, Any]:
             "center_2d": (cx, cy),
         }
 
-    # 兜底：按圆孔估直径（小特征）
-    if circularity > 0.65:
+    # 兜底：圆度较高但未达 strict 圆阈值的小圆孔
+    if circularity >= 0.82:
         diameter = 2.0 * math.sqrt(area / math.pi)
         return {
             "contour_type": "circle",
@@ -184,6 +189,20 @@ def _analyze_loop_2d(pts2d: np.ndarray) -> dict[str, Any]:
         "parameters": {"diameter": None, "length": length, "width": width, "across_flats": None},
         "center_2d": (cx, cy),
     }
+
+
+def _is_rectangle_like(corners: int, aspect: float, circularity: float) -> bool:
+    """True when loop is a rectangle or rounded-rect (not slot/circle)."""
+    if aspect > _RECT_ASPECT_MAX:
+        return False
+    if circularity >= _CIRCULARITY_CIRCLE:
+        return False
+    if circularity < _RECT_CIRCULARITY_MIN:
+        return False
+    if corners in (4, 5):
+        return True
+    # 圆角矩形：离散后拐角数常 > 6，但 OBB 仍近方形/矩形
+    return True
 
 
 def _lift2to3(

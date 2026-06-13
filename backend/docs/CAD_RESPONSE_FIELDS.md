@@ -11,6 +11,7 @@
 | 接口 | 响应类型 | 说明 |
 |------|----------|------|
 | `POST /api/v1/cad/analyze/face` | **CadFaceAnalyzeResult** | 单面提取（**推荐**） |
+| `POST /api/v1/cad/analyze/face_spread` | **CadFaceSpreadResult** | 选面 → 内/外表面扩散到整个装配体同侧表面（含 3D 深度） |
 | `POST /api/v1/cad/analyze/face_and_path` | **CadFaceAnalyzeAndPathResponse** | `{ analyze, path }` |
 | `POST /api/v1/cad/path/generate/face` | PathPlanResult | 基于单面 analyze JSON |
 | `POST /api/v1/cad/analyze` | CadAnalyzeResult | 全模型提取（兼容） |
@@ -36,8 +37,8 @@
 | `wires` | array | 线环 |
 | `contours` | array | 轮廓（类型 + 中心 + 参数） |
 | `outer_contours` | string[] | 该面上外轮廓 contour id |
-| `holes` | array | 孔特征 |
-| `pockets` | array | 型腔（预留，通常 `[]`） |
+| `holes` | array | 孔/凸台特征（含 `kind`/`direction`/`through`/`depth`） |
+| `pockets` | array | 型腔（非圆凹陷，3D 识别后填充） |
 | **`feature_groups`** | object | **按类型分组的特征索引（路径规划用）** |
 | `work_plane` | string | `auto` / `xy` / `yz` / `xz` |
 | `work_plane_normal` | object | 加工平面法向 `{x,y,z}` |
@@ -131,10 +132,57 @@
 | `wires` | array | 所有线环 |
 | `contours` | array | 所有轮廓 |
 | `outer_contours` | string[] | 全局最大外轮廓 id |
-| `holes` | array | 所有孔 |
-| `pockets` | array | 型腔（预留） |
+| `holes` | array | 所有孔/凸台（含 `kind`/`direction`/`through`/`depth`） |
+| `pockets` | array | 型腔（非圆凹陷，3D 识别后填充） |
 | `work_plane` | string | 加工坐标系 |
 | `work_plane_normal` | object | 法向 |
+
+> 全模型 `analyze` 默认也启用 3D 深度识别（`enable_depth=true`）。`faces[]` 含 `side`/`side_score`。
+
+---
+
+## 三-B、CadFaceSpreadResult（选面 → 内/外表面扩散）
+
+`schema_version`: `"1.0"`。由 `POST /api/v1/cad/analyze/face_spread` 返回。
+
+流程：选中一个面 → 用外法向正负判定其为外表面/内表面 → 扩散到整个装配体的全部同侧表面 →
+逐面复用单面算法并叠加 3D 深度识别（通孔/盲孔/型腔/凸台 + 深度）。
+
+| 字段 | 类型 | 含义 |
+|------|------|------|
+| `schema_version` | string | `"1.0"` |
+| `unit` | string | `"mm"` |
+| `target_face_id` | string | 选中的种子面 id |
+| `side` | string | 种子面侧别：`outer` 外表面 / `inner` 内表面 |
+| `side_score` | number | 种子面内外判定得分 |
+| `model_bbox` | object | 零件/装配体包围盒 |
+| `solid_count` | int | 装配体实体数 |
+| `face_ids` | string[] | 本次扩散覆盖的同侧面 id 列表 |
+| `faces` | array | 同侧所有面（含 `side`/`side_score`） |
+| `holes` | array | 同侧表面上的孔/凸台（含 `kind`/`direction`/`through`/`depth`） |
+| `pockets` | array | 型腔（非圆凹陷，见下） |
+| `contours` / `wires` / `polylines` / `reference_points` | array | 同单面结构 |
+| `feature_groups` | object | 按类型分组索引 |
+| `work_plane` / `work_plane_normal` | string / object | 加工坐标系 |
+
+典型用法：选外表面任一面 → 得到整机外蒙皮全部孔/凸台；选内表面任一面 → 得到全部内腔/孔壁特征。
+
+### pockets（型腔）
+
+非圆凹陷（矩形/槽等）在 3D 识别为 `recess` 时写入。
+
+| 字段 | 类型 | 含义 |
+|------|------|------|
+| `id` | string | 如 `pocket_contour_3` |
+| `depth` | number | 型腔深度 mm |
+| `through` | bool \| null | 是否贯通 |
+| `center` | `{x,y,z}` \| null | 口部中心 |
+| `axis` | `{x,y,z}` \| null | 口部外法向 |
+| `contour_type` | string \| null | `rectangle` / `slot` / `unknown` |
+| `face_id` | string \| null | 口部所在面 |
+| `bottom_face_id` | string \| null | 底面 id（预留） |
+| `wire_ids` | string[] | 口部 wire id |
+| `parameters` | object \| null | 口部 L/W 等参数 |
 
 ---
 
@@ -216,8 +264,10 @@
 | `radius` | number \| null | 圆柱/球半径 mm |
 | `outer_wire_id` | string \| null | 外环 wire id |
 | `inner_wire_ids` | string[] | 内环 wire id 列表 |
+| `side` | string \| null | 内/外表面：`outer` 外 / `inner` 内 / `unknown` |
+| `side_score` | number \| null | 内外判定得分 = 外法向·(面上点-所属实体质心)，>0 外、<0 内 |
 
-**前端选面提示**：可先展示 GLB，用户点击面后映射到 `face_{index}`，再调用 `/analyze/face`。
+**前端选面提示**：可先展示 GLB，用户点击面后映射到 `face_{index}`，再调用 `/analyze/face` 或 `/analyze/face_spread`。
 
 ---
 
@@ -236,22 +286,32 @@
 
 ---
 
-## 八、holes（孔）
+## 八、holes（孔 / 凸台）
 
 | 字段 | 类型 | 含义 |
 |------|------|------|
 | `id` | string | 如 `hole_contour_1` |
-| `kind` | string | `circle` / `slot` / `rectangle` / `hexagon` / `unknown` 等 |
-| `contour_type` | string \| null | 与 contours 一致 |
+| `kind` | string | `through` 通孔 / `blind` 盲孔 / `pocket` 型腔 / `boss` 凸台 / `circle` / `slot` 等 |
+| `contour_type` | string \| null | 口部轮廓类型，与 contours 一致 |
+| `direction` | string \| null | `recess` 凹陷(孔/型腔) / `protrusion` 凸出(凸台)；未启用 3D 时为 null |
+| `through` | bool \| null | 凹陷是否贯通（通孔 true、盲孔/型腔 false） |
 | `center` | `{x,y,z}` | 孔心 |
-| `axis` | `{x,y,z}` | 孔轴线 |
+| `axis` | `{x,y,z}` | 孔轴线（口部外法向） |
 | `diameter` | number \| null | 直径 mm |
-| `depth` | number \| null | 深度（常为 null） |
+| `depth` | number \| null | 凹陷深度或凸台高度 mm（3D 识别后填充；未启用/纯 Shell 时 null） |
 | `face_id` | string \| null | 关联面 |
 | `wire_id` | string \| null | 关联 wire |
 | `parameters` | object \| null | 同 contours.parameters |
 
-**说明**：仅平面内环（非外轮廓）且类型为 circle/slot/rectangle/hexagon 时写入 holes。圆柱面合成孔需 `include_cylinder_holes: true`。
+**说明**：
+- `kind` / `direction` / `through` / `depth` 由 3D 深度识别填充（`enable_depth=true`，默认开启，需模型含实体 Solid）。
+- 未启用 3D 或纯 Shell 模型时回退 2D：`kind` 取轮廓类型，`depth/direction/through` 为 null。
+- 圆柱面合成孔需 `include_cylinder_holes: true`。
+
+### holes_by_type 分组 key
+
+`feature_groups.holes_by_type` 仍按 `contour_type`（circle/slot/rectangle/hexagon）分组，
+便于路径规划；具体加工类型见每条孔的 `kind`/`direction`/`through`。
 
 ---
 

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import cors_allow_credentials, cors_allow_origins_raw, ensure_runtime_dirs
 from app.routers import cad, convert, health, ikfast, stp
@@ -39,6 +41,31 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _starlette_http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    """multipart 解析失败时给出可操作的提示（前端常误设 Content-Type）。"""
+    if exc.status_code == 400 and exc.detail == "There was an error parsing the body":
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": (
+                    "请求体解析失败。POST /api/v1/cad/upload 必须使用 multipart/form-data，"
+                    "字段名 file，且不要手动设置 Content-Type（让浏览器自动生成 boundary）。"
+                    "若使用 axios，请用 FormData 且不要设置 headers['Content-Type']。"
+                    "备选：POST /api/v1/cad/upload/binary，Content-Type: application/octet-stream，"
+                    "body 为 STEP 文件字节，可选 Header X-Filename: model.stp 或 ?filename=model.stp"
+                )
+            },
+        )
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@app.exception_handler(HTTPException)
+async def _fastapi_http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
 
 app.include_router(health.router)
 app.include_router(convert.router, prefix="/api/v1")

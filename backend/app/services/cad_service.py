@@ -19,6 +19,7 @@ from pathlib import Path
 from app.models.cad import (
     CadAnalyzeAndPathResponse,
     CadFaceAnalyzeResult,
+    CadFaceSpreadResult,
     CadAnalyzeOptions,
     CadAnalyzeResult,
     PathPlanOptions,
@@ -100,7 +101,7 @@ def _analyze_via_subprocess(
             cwd=str(_BACKEND_ROOT),
             capture_output=True,
             env=env,
-            timeout=600,
+            timeout=6000,
             creationflags=creationflags,
         )
         if not resp_path.is_file():
@@ -126,13 +127,19 @@ def _analyze_inprocess(
     face_id: str | None,
     options: CadAnalyzeOptions,
 ) -> dict:
-    from app.occ.features.extractor import extract_all_features, extract_face_features
+    from app.occ.features.extractor import (
+        extract_all_features,
+        extract_face_features,
+        extract_face_spread_features,
+    )
     from app.occ.loader import read_step_file
 
     shape = read_step_file(step_path)
-    if mode == "face":
+    if mode in ("face", "face_spread"):
         if not face_id:
             raise ValueError("face_id 不能为空")
+        if mode == "face_spread":
+            return extract_face_spread_features(shape, options, face_id=face_id)
         return extract_face_features(shape, options, face_id=face_id)
     return extract_all_features(shape, options)
 
@@ -181,6 +188,18 @@ def analyze_step_face_path(
     return CadFaceAnalyzeResult(**raw)
 
 
+def analyze_step_face_spread_path(
+    step_path: str | Path,
+    face_id: str,
+    options: CadAnalyzeOptions | None = None,
+) -> CadFaceSpreadResult:
+    """选面 → 内/外表面扩散分析（缓存路径版，无需重传文件）。"""
+    require_occ()
+    opts = options or CadAnalyzeOptions()
+    raw = _analyze_path(Path(step_path), mode="face_spread", face_id=face_id, options=opts)
+    return CadFaceSpreadResult(**raw)
+
+
 # --------------------------------------------------------------------------- #
 # Bytes-based analyze (compatibility: caller uploads the STEP file each call)
 # --------------------------------------------------------------------------- #
@@ -205,6 +224,21 @@ def analyze_step_face(
     path = _materialize_step(data, filename)
     try:
         return analyze_step_face_path(path, face_id=face_id, options=options)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def analyze_step_face_spread(
+    data: bytes,
+    filename: str,
+    face_id: str,
+    options: CadAnalyzeOptions | None = None,
+) -> CadFaceSpreadResult:
+    """选面 → 内/外表面扩散分析（字节流版，每次上传文件）。"""
+    require_occ()
+    path = _materialize_step(data, filename)
+    try:
+        return analyze_step_face_spread_path(path, face_id=face_id, options=options)
     finally:
         path.unlink(missing_ok=True)
 

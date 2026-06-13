@@ -15,7 +15,11 @@ FastAPI  `/api/v1/cad/*`
          ├─ loader.py            STEP → TopoDS_Shape
          ├─ discretize.py        Edge/Wire → 折线
          ├─ geometry_utils.py    面包围盒、曲面分类、加工坐标系
-         ├─ features/extractor.py  点/面/线/孔识别
+         ├─ topology.py          边-面/面-实体邻接图、实体质心、外法向（3D 基础设施）
+         ├─ features/extractor.py        点/面/线/孔识别 + 内外扩散编排
+         ├─ features/contour_classifier.py 2D 轮廓分类
+         ├─ features/face_side.py        内/外表面判定（外法向正负）
+         ├─ features/feature3d.py        3D 深度识别（通孔/盲孔/型腔/凸台）
          └─ path/planner.py      2.5D 刀路生成
 ```
 
@@ -77,11 +81,11 @@ FOR face IN TopExp_Explorer(shape, TopAbs_FACE):
 
 对每条 `Wire`：
 
-1. 收集所有 `Edge`，用 `GCPnts_QuasiUniformDeflection` 按 `linear_deflection` 采样为 3D 折线。
-2. 边端点连接容差与 `linear_deflection` 自适应（非固定 1e-6），提高弧面/大模型闭合率。
-3. 多段链不连通时保留最长连通链，避免伪连接飞线。
+1. 用 **`BRepTools_WireExplorer`** 按 wire 拓扑顺序遍历边，再逐边离散（`GCPnts_QuasiUniformDeflection`）。
+2. 边端点连接容差与 `linear_deflection` 自适应；**保留 wire 上全部边段**（不再只取最长链），避免圆孔折线被截成弧。
+3. 若容差内拼接失败，仍顺序保留各边几何，避免丢边；必要时回退贪心拼链并串联所有分段。
 4. 首尾相连判断 `closed`（容差与离散精度同量级）。
-5. 平面面：投影到**面法向**二维，用鞋带公式算面积；非平面面：PCA 投影 + 非平面度检测。
+5. 平面面：投影到**面外法向**二维，用鞋带公式算面积；非平面面：PCA 投影 + 非平面度检测。
 
 **平面外轮廓判定**（同一平面 Face）：
 
@@ -100,13 +104,17 @@ FOR face IN TopExp_Explorer(shape, TopAbs_FACE):
 | contour_type | 判定依据 |
 |--------------|----------|
 | `outer` | 外环 wire |
-| `circle` | 圆度 ≥ 0.88，或兜底圆度 > 0.65 |
+| `circle` | 圆度 ≥ 0.88，或兜底圆度 ≥ 0.82（近圆小孔） |
 | `slot` | 长宽比 ≥ 1.75 且非圆 |
 | `hexagon` | 约 6 拐角 + 边长均匀 |
-| `rectangle` | 4–6 拐角或 OBB 近似矩形 |
+| `rectangle` | 4–5 直角拐角，或 OBB 长宽比 ≤ 1.6 且圆度 ∈ [0.55, 0.88)（含圆角矩形） |
 | `unknown` | 非平面度超阈值或无法分类 |
 
-非平面面使用 `prefer_pca_plane=true`，投影基由 PCA 拟合。
+非平面面使用 `prefer_pca_plane=true`，投影基由 PCA 拟合（仅用于 2D 形状分类）。
+
+**轮廓法向 `contours[].normal`**：始终为 **宿主面外法向**（`topology.face_point_and_outward_normal`），
+不再使用 PCA/加工平面法向，避免自由曲面/邻接面上圆弧法向「贴着平面」。
+2D 分类仍用 PCA 投影，与 API 输出的法向字段分离。
 
 ### 3.4 孔（Hole）识别
 
@@ -125,7 +133,10 @@ FOR face IN TopExp_Explorer(shape, TopAbs_FACE):
 
 **去重**：孔心坐标按 0.01mm 网格量化，距离 < 1mm 视为同一孔。
 
-**类型**（可扩展）：`through | blind | counterbore | slot`；当前默认 `through`，盲孔需结合对面圆柱或深度链分析（后续可加 `BRepClass3d_SolidClassifier`）。
+**类型**：由 3D 深度识别填充（见 3.9）。圆形凹陷 → `through`（通孔）/ `blind`（盲孔）；
+非圆凹陷 → `pocket`（型腔，同时登记到 `pockets[]`）；凸出特征 → `boss`（凸台）。
+每个孔附带 `direction`（recess 凹 / protrusion 凸）、`through`（是否贯通）、`depth`（深度/高度，mm）。
+若模型无实体（纯 Shell）或 `enable_depth=false`，则回退为 2D，`kind` 取轮廓类型、`depth=null`。
 
 ### 3.5 参考点（Reference Points）
 
@@ -138,9 +149,73 @@ FOR face IN TopExp_Explorer(shape, TopAbs_FACE):
 
 ### 3.6 口袋（Pocket）
 
-识别框架已预留 `pockets[]`：可基于「平面底面 + 侧壁面夹角 + 内环面积」规则扩展，当前版本返回空列表。
+非圆凹陷特征（矩形/槽等内环）在 3D 识别为 `recess` 时，除写入 `holes[]`（kind=`pocket`）外，
+同时登记到 `pockets[]`，附带 `depth`、`through`、`center`、`axis`、`contour_type`、口部 `parameters`。
+`bottom_face_id` 预留（后续可由壁面→底面邻接链补全）。
 
-### 3.7 加工坐标系（Work Plane）
+### 3.7 内 / 外表面判定（features/face_side.py）
+
+需求：前端选中一个面后，需要知道它是「外表面」还是「内表面」，从而扩散到整个装配体的同侧表面。
+
+判定公式（外法向正负）：
+
+```
+score = n̂ · (P − C)
+```
+
+- `P`：面上一点（参数域中点，世界坐标）；
+- `n̂`：该点处指向实体外部的单位**外法向**（几何法向按 `TopAbs_REVERSED` 取反）；
+- `C`：该面**所属实体**的体积质心（装配体逐实体计算，`topology.build_face_solid_map` 定位 owning solid）。
+
+| 条件 | 判定 | 典型 |
+|------|------|------|
+| `score ≥ 0` | `outer` 外表面 | 顶面、侧面、凸台外壁 |
+| `score < 0` | `inner` 内表面 | 孔壁、镗孔、内腔、装配贴合面 |
+| 法向不可定义 | `unknown` | 退化面 |
+
+- 对自由曲面（B-spline）同样适用（只依赖法向与质心，不依赖解析曲面类型）。
+- 极端凹形（深型腔底面）为近似启发式，`score` 越接近 0 越不确定，写入 `face.side_score` 供阈值过滤。
+
+### 3.8 3D 深度识别（features/feature3d.py）
+
+在 2.5D 口部轮廓基础上补齐**深度方向**语义，核心是 `BRepClass3d_SolidClassifier` 射线步进
+（点在实体内/外判定）。对每条内环口部（中心 `C`、外法向 `N`）：
+
+1. **方向判定（两侧探针）**：在 `C ± εN` 取点判定内外：
+   - 外侧 `C+εN` 在实体内（IN）→ `protrusion` 凸台；
+   - 内侧 `C−εN` 在实体外（OUT，空腔）→ `recess` 凹陷。
+2. **通孔 / 盲孔（轴向步进）**：沿 `−N` 向材料内步进；命中材料（IN）即孔底 → `blind`；
+   一直为空腔（OUT）直到穿出包围盒 → `through`。
+3. **深度量化（壁面轴向跨度）**：取与口部 wire 共享边的侧壁面顶点，投影到轴 `N`，
+   相对口部下方跨度 = 凹陷深度，上方跨度 = 凸台高度。壁面几何比步进更精确，作为深度首选；
+   步进只负责类型判定与兜底。
+
+```
+通孔 through ──→ depth = 壁面贯穿厚度, through=true,  direction=recess
+盲孔 blind  ──→ depth = 口部到孔底,    through=false, direction=recess
+型腔 pocket ──→ 非圆凹陷, 另登记 pockets[]
+凸台 boss   ──→ depth = 凸台高度,      direction=protrusion
+```
+
+- 不依赖曲面是平面还是自由曲面 → **自由曲面上的孔/凸台同样可识别**。
+- 装配体：按口部 host 面的 owning solid 建立分类器并缓存（逐实体）。
+- 健壮性：任何 3D 步骤异常都回退到 2D（`depth=null`），不影响轮廓/孔的 2D 输出。
+
+### 3.9 内/外表面扩散（extract_face_spread_features）
+
+入口：`extract_face_spread_features(shape, options, face_id=...)` → `POST /cad/analyze/face_spread`。
+
+```
+1. 解析种子面 face_id → 用 3.7 判定其 side（outer / inner）
+2. 扩散：收集整个装配体中所有同侧的面（FaceSideClassifier.faces_on_side）
+3. 逐面复用 _extract_face_payload（与单面/全模型同一套算法）
+4. 叠加 3.8 的 3D 深度识别，聚合孔/型腔/凸台
+5. 返回 CadFaceSpreadResult（含 side、solid_count、face_ids、holes、pockets…）
+```
+
+选中外表面的一个面 → 得到整机外蒙皮的全部孔/凸台；选中内表面 → 得到全部内腔/孔壁特征。
+
+### 3.10 加工坐标系（Work Plane）
 
 | 模式 | 法向 |
 |------|------|
@@ -199,7 +274,10 @@ FOR face IN TopExp_Explorer(shape, TopAbs_FACE):
 
 1. `POST /stp/convert` → GLB 显示
 2. 用户选面 → `face_id`
-3. `POST /cad/analyze/face` → `feature_groups` 按类型取特征
+3. 选其一：
+   - `POST /cad/analyze/face` → 仅该面的 `feature_groups`；
+   - `POST /cad/analyze/face_spread` → 判定内/外表面并扩散到整个装配体同侧表面，
+     返回带 `depth`/`direction`/`through` 的孔/型腔/凸台（`CadFaceSpreadResult`）。
 4. `POST /cad/path/generate/face` 或 `/analyze/face_and_path` → 刀路
 
 完整契约与示例见 **[CAD_API_EXTERNAL.md](./CAD_API_EXTERNAL.md)**，字段说明见 **[CAD_RESPONSE_FIELDS.md](./CAD_RESPONSE_FIELDS.md)**。
@@ -221,10 +299,21 @@ pip install -r backend/requirements.txt
 
 ---
 
-## 7. 扩展建议
+## 7. 已实现的 3D 能力与后续扩展
+
+已实现（本版本）：
+
+- **内/外表面判定**：外法向正负，逐实体质心（3.7）。
+- **3D 深度识别**：通孔/盲孔/型腔/凸台 + 深度，`BRepClass3d_SolidClassifier` 射线步进（3.8）。
+- **内外扩散**：选面 → 同侧表面全装配体扩散（3.9，`/cad/analyze/face_spread`）。
+- **自由曲面**：深度/凸台识别不依赖解析曲面类型，B-spline 面上的孔同样可识别。
+- **装配体**：`Compound` 多 `Solid` 逐实体质心与分类器，面全局索引保持一致。
+
+后续扩展：
 
 1. **多层粗精加工**：对 `z` 从 `zmax` 到 `zmin` 按 `ap` 步距切片，重复 4.1–4.3。
 2. **轮廓偏置**：外轮廓 inward offset 使用 `BRepOffsetAPI_MakeOffset`。
 3. **孔序优化**：孔心 TSP（最近邻 / 2-opt）减少空行程。
-4. **槽识别**：内环长宽比 > 阈值 → `kind: slot`。
-5. **装配体**：遍历 `TopAbs_SOLID` 多个零件分别分析并带 `part_id`。
+4. **沉头/台阶孔**：同轴多级圆环 + 不同深度 → `counterbore`。
+5. **型腔底面**：壁面 → 底面邻接链补全 `pocket.bottom_face_id`。
+6. **零件级标签**：为每个特征附带 `part_id`（owning solid 索引），便于装配体分零件加工。

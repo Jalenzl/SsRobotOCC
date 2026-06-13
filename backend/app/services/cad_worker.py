@@ -26,17 +26,23 @@ from pathlib import Path
 
 def _run(req: dict) -> dict:
     from app.models.cad import CadAnalyzeOptions
-    from app.occ.features.extractor import extract_all_features, extract_face_features
+    from app.occ.features.extractor import (
+        extract_all_features,
+        extract_face_features,
+        extract_face_spread_features,
+    )
     from app.occ.loader import read_step_file
 
     options = CadAnalyzeOptions(**(req.get("options") or {}))
     shape = read_step_file(req["step_path"])
 
     mode = req.get("mode", "full")
-    if mode == "face":
+    if mode in ("face", "face_spread"):
         face_id = req.get("face_id")
         if not face_id:
             raise ValueError("face_id 不能为空")
+        if mode == "face_spread":
+            return extract_face_spread_features(shape, options, face_id=face_id)
         return extract_face_features(shape, options, face_id=face_id)
     return extract_all_features(shape, options)
 

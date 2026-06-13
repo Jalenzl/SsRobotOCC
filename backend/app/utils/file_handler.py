@@ -16,6 +16,24 @@ async def read_upload_file(file: UploadFile) -> tuple[bytes, str]:
     return raw, name
 
 
+def ensure_step_filename(filename: str, *, default_stem: str = "model") -> str:
+    """Normalize upload filename for STEP cache (浏览器 Blob / 无扩展名文件常见).
+
+    - ``part.stp`` / ``part.step`` → 原样保留
+    - 空文件名 → ``model.stp``
+    - 无扩展名 ``assembly`` → ``assembly.stp``
+    """
+    name = (filename or "").strip()
+    lower = name.lower()
+    if lower.endswith(".stp") or lower.endswith(".step"):
+        return name
+    if not name:
+        return f"{default_stem}.stp"
+    if "." in name:
+        return name
+    return f"{name}.stp"
+
+
 def require_extension(filename: str, allowed: tuple[str, ...]) -> None:
     lower = filename.lower()
     if not any(lower.endswith(ext) for ext in allowed):

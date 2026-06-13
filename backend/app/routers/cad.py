@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from app.models.cad import (
@@ -12,6 +12,7 @@ from app.models.cad import (
     CadAnalyzeOptions,
     CadFaceAnalyzeAndPathResponse,
     CadFaceAnalyzeResult,
+    CadFaceSpreadResult,
     CadAnalyzeResult,
     PathPlanOptions,
     PathPlanResult,
@@ -27,11 +28,13 @@ from app.services.cad_service import (
     analyze_step,
     analyze_step_face,
     analyze_step_face_path,
+    analyze_step_face_spread,
+    analyze_step_face_spread_path,
     analyze_step_path,
     plan_path_from_analyze,
     plan_path_from_face_analyze,
 )
-from app.utils.file_handler import read_upload_file, require_extension
+from app.utils.file_handler import ensure_step_filename, read_upload_file, require_extension
 from app.utils.form_json import parse_optional_json_form, parse_required_json_form
 
 router = APIRouter(prefix="/cad", tags=["cad"])
@@ -53,6 +56,16 @@ def _cache_path(model_id: str) -> Path:
         ) from e
 
 
+def _persist_step_upload(raw: bytes, filename: str) -> dict:
+    """校验文件名并写入 STEP 缓存，返回 model_id 等元数据。"""
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty file")
+    name = ensure_step_filename(filename)
+    require_extension(name.lower(), (".stp", ".step"))
+    cad_cache.prune_expired()
+    return cad_cache.store_step(raw, name)
+
+
 async def _resolve_step(
     file: UploadFile | None, model_id: str | None
 ) -> tuple[bytes | None, str | None, Path | None]:
@@ -63,6 +76,7 @@ async def _resolve_step(
     if file is None:
         raise HTTPException(status_code=400, detail="需要提供 file 或 model_id 其中之一")
     raw, name = await read_upload_file(file)
+    name = ensure_step_filename(name)
     require_extension(name.lower(), (".stp", ".step"))
     return raw, name, None
 
@@ -76,8 +90,10 @@ def cad_status() -> dict:
         "api_version": "1.1",
         "endpoints": [
             "POST /api/v1/cad/upload",
+            "POST /api/v1/cad/upload/binary",
             "POST /api/v1/cad/analyze",
             "POST /api/v1/cad/analyze/face",
+            "POST /api/v1/cad/analyze/face_spread",
             "POST /api/v1/cad/analyze/face_and_path",
             "POST /api/v1/cad/path/generate",
             "POST /api/v1/cad/path/generate/face",
@@ -90,11 +106,34 @@ def cad_status() -> dict:
 async def cad_upload(
     file: UploadFile = File(..., description="STEP/STP 零件文件，上传一次后用 model_id 复用"),
 ) -> JSONResponse:
-    """上传 STEP 一次，返回 model_id；后续选面分析只需传 model_id，无需重传文件。"""
+    """上传 STEP 一次，返回 model_id；后续选面分析只需传 model_id，无需重传文件。
+
+    要求 ``multipart/form-data``，字段名 **file**。
+    不要手动设置 ``Content-Type``（须由浏览器自动生成 boundary）。
+    若 multipart 解析失败，可改用 ``POST /cad/upload/binary`` 直接传文件字节。
+    """
     raw, name = await read_upload_file(file)
-    require_extension(name.lower(), (".stp", ".step"))
-    cad_cache.prune_expired()
-    meta = cad_cache.store_step(raw, name)
+    meta = _persist_step_upload(raw, name)
+    return JSONResponse(content=meta)
+
+
+@router.post("/upload/binary")
+async def cad_upload_binary(
+    request: Request,
+    filename: str | None = Query(
+        None,
+        description="文件名，建议带 .stp/.step；也可用请求头 X-Filename",
+    ),
+    x_filename: str | None = Header(default=None, alias="X-Filename"),
+) -> JSONResponse:
+    """直接上传 STEP 原始字节（``application/octet-stream``），绕过 multipart 解析。
+
+    适用于 axios/fetch 手动设置了 ``Content-Type: multipart/form-data`` 导致
+    ``There was an error parsing the body`` 的前端场景。
+    """
+    raw = await request.body()
+    hint = filename or x_filename or "model.stp"
+    meta = _persist_step_upload(raw, hint)
     return JSONResponse(content=meta)
 
 
@@ -144,6 +183,33 @@ async def cad_analyze_face(
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=422, detail=f"单面 CAD 分析失败: {e}") from e
+    return JSONResponse(content=result.model_dump())
+
+
+@router.post("/analyze/face_spread", response_model=CadFaceSpreadResult)
+async def cad_analyze_face_spread(
+    file: UploadFile | None = File(None, description="STEP/STP 零件文件（或改用 model_id）"),
+    face_id: str = Form(..., description='前端选中的种子面 ID，例如 "face_12"'),
+    model_id: str | None = Form(None, description="来自 /cad/upload 的 model_id（替代 file）"),
+    options_json: str | None = Form(
+        None,
+        description='可选 JSON，留空即可。示例: {"enable_depth":true,"work_plane":"auto"}',
+    ),
+) -> JSONResponse:
+    """选中一个面 → 判定内/外表面 → 扩散到整个装配体同侧表面，识别孔/型腔/凸台及深度。"""
+    raw, name, cached = await _resolve_step(file, model_id)
+    opts = parse_optional_json_form(options_json, CadAnalyzeOptions, field_name="options_json")
+    try:
+        if cached is not None:
+            result = analyze_step_face_spread_path(cached, face_id=face_id, options=opts)
+        else:
+            result = analyze_step_face_spread(raw, name, face_id=face_id, options=opts)
+    except OccNotInstalledError as e:
+        raise _occ_http(e) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=422, detail=f"面扩散分析失败: {e}") from e
     return JSONResponse(content=result.model_dump())
 
 

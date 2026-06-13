@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from OCC.Core.BRepAdaptor import BRepAdaptor_Curve
+from OCC.Core.BRepTools import BRepTools_WireExplorer
 from OCC.Core.GCPnts import GCPnts_QuasiUniformDeflection
-from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_WIRE
-from OCC.Core.TopExp import TopExp_Explorer
+from OCC.Core.TopAbs import TopAbs_REVERSED
 from OCC.Core.TopLoc import TopLoc_Location
 from OCC.Core.TopoDS import topods
 from OCC.Core.gp import gp_Pnt
@@ -55,6 +55,48 @@ def discretize_edge(edge, linear_deflection: float, angular_deflection: float = 
     return pts
 
 
+def _wire_edges_ordered(wire) -> list:
+    """沿 wire 拓扑顺序返回边（BRepTools_WireExplorer，比 TopExp 无序遍历可靠）。"""
+    edges: list = []
+    exp = BRepTools_WireExplorer(wire)
+    while exp.More():
+        edges.append(topods.Edge(exp.Current()))
+        exp.Next()
+    return edges
+
+
+def _append_segment(
+    chain: list[tuple[float, float, float]],
+    seg: list[tuple[float, float, float]],
+    join_tol: float,
+) -> bool:
+    """把一条边折线接到 chain 末尾；成功返回 True。"""
+    if not seg:
+        return True
+    if not chain:
+        chain.extend(seg)
+        return True
+    if _dist(chain[-1], seg[0]) <= join_tol:
+        chain.extend(seg[1:])
+        return True
+    if _dist(chain[-1], seg[-1]) <= join_tol:
+        chain.extend(list(reversed(seg[:-1])))
+        return True
+    return False
+
+
+def _discretize_edge_along_wire(
+    edge,
+    linear_deflection: float,
+    angular_deflection: float,
+) -> list[tuple[float, float, float]]:
+    """按 wire 中的边朝向离散（REVERSED 边需翻转点序）。"""
+    pts = discretize_edge(edge, linear_deflection, angular_deflection)
+    if edge.Orientation() == TopAbs_REVERSED:
+        pts = list(reversed(pts))
+    return pts
+
+
 def wire_to_polyline(
     wire,
     linear_deflection: float,
@@ -62,89 +104,77 @@ def wire_to_polyline(
     *,
     location: TopLoc_Location | None = None,
 ) -> list[tuple[float, float, float]]:
-    """Discretize a TopoDS_Wire into an ordered polyline.
+    """把 TopoDS_Wire 离散为有序 3D 折线。
 
-    IMPORTANT:
-    - TopExp_Explorer(wire, EDGE) does NOT guarantee edge order along the wire.
-      If we simply append sampled points by explorer order, the resulting point
-      sequence can "jump" across the model, which shows up as long unwanted
-      segments when visualized in the frontend.
+    主路径：``BRepTools_WireExplorer`` 按 wire 拓扑顺序遍历每条边，保留 **全部**
+    边段（不再只取最长链），避免圆孔/圆弧被截成一段。
 
-    Strategy:
-    - Sample each edge independently.
-    - Greedily build a continuous chain by always selecting the next edge whose
-      endpoint matches current chain end (forward or reversed).
-    - If no connecting edge is found, start a new chain (wire is disjoint or
-      explorer order is inconsistent). We still append, but we avoid creating
-      an artificial long segment between disconnected parts.
-
-    NOTE:
-    - Endpoint matching tolerance is tied to discretization deflection instead
-      of a fixed epsilon, which is more robust for curved/large models.
-    - If multiple disconnected chains remain, we keep only the longest chain.
-      A single polyline cannot represent disjoint chains without introducing
-      fake bridge segments between chains.
+    若有序拼接因容差失败（少见），回退到旧的贪心拼链；仍失败则按顺序硬拼，
+    宁可出现短间隙也不丢弃边。
     """
+    ordered_edges = _wire_edges_ordered(wire)
+    if not ordered_edges:
+        return []
 
-    edges = []
-    exp = TopExp_Explorer(wire, TopAbs_EDGE)
-    while exp.More():
-        edges.append(topods.Edge(exp.Current()))
-        exp.Next()
+    join_tol = _join_tolerance(linear_deflection)
+    chain: list[tuple[float, float, float]] = []
+
+    for edge in ordered_edges:
+        seg = _discretize_edge_along_wire(edge, linear_deflection, angular_deflection)
+        if not _append_segment(chain, seg, join_tol):
+            # 容差内接不上：仍保留几何，避免丢边导致「圆变弧」
+            if chain and seg:
+                chain.extend(seg)
+            elif seg:
+                chain.extend(seg)
+
+    if not chain and ordered_edges:
+        chain = _wire_to_polyline_greedy_fallback(ordered_edges, linear_deflection, angular_deflection)
+
+    if chain and len(chain) >= 3:
+        close_tol = max(join_tol * 2.0, linear_deflection * 2.0, 1e-3)
+        if _dist(chain[0], chain[-1]) <= close_tol:
+            chain.append(chain[0])
+
+    if location is not None:
+        return apply_location(chain, location)
+    return chain
+
+
+def _wire_to_polyline_greedy_fallback(
+    edges: list,
+    linear_deflection: float,
+    angular_deflection: float,
+) -> list[tuple[float, float, float]]:
+    """有序拼接失败时的兜底：贪心拼链，但保留所有边（按链顺序串联，不截断）。"""
     if not edges:
         return []
 
-    # sample all edges first
-    segs: list[list[tuple[float, float, float]]] = [
-        discretize_edge(e, linear_deflection, angular_deflection) for e in edges
-    ]
-
+    segs = [_discretize_edge_along_wire(e, linear_deflection, angular_deflection) for e in edges]
+    join_tol = _join_tolerance(linear_deflection)
     used = [False] * len(segs)
     chains: list[list[tuple[float, float, float]]] = []
-    join_tol = _join_tolerance(linear_deflection)
-
-    def append_seg(chain: list[tuple[float, float, float]], seg: list[tuple[float, float, float]]) -> None:
-        if not seg:
-            return
-        if not chain:
-            chain.extend(seg)
-            return
-        if _dist(chain[-1], seg[0]) <= join_tol:
-            chain.extend(seg[1:])
-        elif _dist(chain[-1], seg[-1]) <= join_tol:
-            chain.extend(list(reversed(seg[:-1])))
-        else:
-            # disconnected: start a new chain elsewhere
-            chains.append(chain.copy())
-            chain.clear()
-            chain.extend(seg)
-
-    # build chains
     cur: list[tuple[float, float, float]] = []
 
-    # start from first non-empty seg
     start_idx = next((i for i, s in enumerate(segs) if s), None)
     if start_idx is None:
         return []
-
     cur.extend(segs[start_idx])
     used[start_idx] = True
 
     while True:
         found = False
-        endp = cur[-1]
+        endp = cur[-1] if cur else None
         for i, seg in enumerate(segs):
-            if used[i] or not seg:
+            if used[i] or not seg or endp is None:
                 continue
             if _dist(endp, seg[0]) <= join_tol or _dist(endp, seg[-1]) <= join_tol:
-                append_seg(cur, seg)
+                _append_segment(cur, seg, join_tol)
                 used[i] = True
                 found = True
                 break
         if found:
             continue
-
-        # no next edge connects to current chain; try start a new chain
         next_idx = next((i for i, s in enumerate(segs) if (not used[i]) and s), None)
         if next_idx is None:
             break
@@ -155,17 +185,21 @@ def wire_to_polyline(
     if cur:
         chains.append(cur)
 
-    # Keep the longest connected chain; avoid fake bridges between disjoint chains.
-    chain = max(chains, key=_polyline_length, default=[])
+    if not chains:
+        return []
 
-    if chain and len(chain) >= 3:
-        close_tol = max(join_tol * 2.0, linear_deflection * 2.0, 1e-3)
-        if _dist(chain[0], chain[-1]) <= close_tol:
-            chain.append(chain[0])
-
-    if location is not None:
-        return apply_location(chain, location)
-    return chain
+    # 串联所有链，避免只保留最长一段
+    merged: list[tuple[float, float, float]] = []
+    for part in chains:
+        if not part:
+            continue
+        if not merged:
+            merged.extend(part)
+            continue
+        if _append_segment(merged, part, join_tol):
+            continue
+        merged.extend(part)
+    return merged
 
 
 def wire_area_if_planar(wire) -> float | None:

@@ -81,6 +81,14 @@ class FaceFeature(BaseModel):
     bbox: BoundingBox3D | None = None
     outer_wire_id: str | None = None
     inner_wire_ids: list[str] = Field(default_factory=list)
+    side: str | None = Field(
+        None,
+        description="内/外表面判定：outer 外表面 | inner 内表面 | unknown（法向不可定义）",
+    )
+    side_score: float | None = Field(
+        None,
+        description="内外判定得分 = 外法向·(面上点-所属实体质心)，>0 外、<0 内",
+    )
 
 
 class ContourParameters(BaseModel):
@@ -124,13 +132,21 @@ class WireFeature(BaseModel):
 class HoleFeature(BaseModel):
     id: str
     kind: str = Field(
-        description="through | blind | counterbore | slot | rectangle | hexagon | circle | unknown"
+        description=(
+            "through 通孔 | blind 盲孔 | pocket 型腔 | boss 凸台 | counterbore 沉头 | "
+            "slot | rectangle | hexagon | circle | unknown"
+        )
     )
     contour_type: str | None = Field(None, description="与 contours.contour_type 一致")
+    direction: str | None = Field(
+        None,
+        description="recess 凹陷(孔/型腔，材料向内) | protrusion 凸出(凸台，材料向外)",
+    )
+    through: bool | None = Field(None, description="凹陷是否贯通（通孔 True，盲孔/型腔 False）")
     center: Point3D
     axis: Vector3D
     diameter: float | None = None
-    depth: float | None = None
+    depth: float | None = Field(None, description="凹陷深度或凸台高度 (mm)，3D 识别后填充")
     face_id: str | None = None
     wire_id: str | None = None
     cylindrical_face_ids: list[str] = Field(default_factory=list)
@@ -141,9 +157,15 @@ class HoleFeature(BaseModel):
 
 class PocketFeature(BaseModel):
     id: str
-    bottom_face_id: str
+    bottom_face_id: str | None = None
     depth: float
+    through: bool | None = Field(None, description="型腔是否贯通")
+    center: Point3D | None = None
+    axis: Vector3D | None = None
+    contour_type: str | None = Field(None, description="型腔口部轮廓：rectangle | slot | unknown")
+    face_id: str | None = Field(None, description="型腔口部所在面 id")
     wire_ids: list[str] = Field(default_factory=list)
+    parameters: ContourParameters | None = None
 
 
 class ShapeSummary(BaseModel):
@@ -166,6 +188,13 @@ class CadAnalyzeOptions(BaseModel):
         description=(
             "Whether to synthesize hole contours from cylindrical faces. "
             "Disabled by default to avoid treating outer cylinders/fillets as holes."
+        ),
+    )
+    enable_depth: bool = Field(
+        True,
+        description=(
+            "是否启用 3D 深度识别（通孔/盲孔/型腔/凸台 + 深度）。"
+            "需要模型含实体(Solid)；纯 Shell 模型自动回退到 2D。"
         ),
     )
     model_config = {"use_enum_values": True}
@@ -215,6 +244,35 @@ class CadFaceAnalyzeResult(BaseModel):
     outer_contours: list[str] = Field(default_factory=list)
     holes: list[HoleFeature]
     pockets: list[PocketFeature]
+    feature_groups: FaceFeatureGroups
+    work_plane: str
+    work_plane_normal: Vector3D
+
+
+class CadFaceSpreadResult(BaseModel):
+    """选面 → 内/外表面扩散分析结果。
+
+    流程：选中一个面 → 用外法向正负判定该面是外表面还是内表面 →
+    扩散到整个装配体的全部同侧表面 → 复用单面算法逐面提取轮廓/孔，
+    并叠加 3D 深度识别（通孔/盲孔/型腔/凸台 + 深度）。
+    """
+
+    schema_version: str = "1.0"
+    unit: str = "mm"
+    target_face_id: str = Field(description="前端选中的种子面 id")
+    side: str = Field(description="种子面判定的侧别：outer 外表面 | inner 内表面")
+    side_score: float = Field(description="种子面内外判定得分")
+    model_bbox: BoundingBox3D
+    solid_count: int = Field(1, description="装配体实体数")
+    face_ids: list[str] = Field(default_factory=list, description="本次扩散覆盖的同侧面 id")
+    faces: list[FaceFeature] = Field(default_factory=list)
+    reference_points: list[ReferencePoint] = Field(default_factory=list)
+    polylines: list[Polyline3D] = Field(default_factory=list)
+    wires: list[WireFeature] = Field(default_factory=list)
+    contours: list[ContourFeature] = Field(default_factory=list)
+    outer_contours: list[str] = Field(default_factory=list)
+    holes: list[HoleFeature] = Field(default_factory=list)
+    pockets: list[PocketFeature] = Field(default_factory=list)
     feature_groups: FaceFeatureGroups
     work_plane: str
     work_plane_normal: Vector3D
