@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import cors_allow_credentials, cors_allow_origins_raw, ensure_runtime_dirs
-from app.routers import cad, convert, health, ikfast, stp
+from app.routers import cad, convert, health, ikfast, stp, stp_hierarchy
 
 ensure_runtime_dirs()
 
@@ -43,6 +44,14 @@ app.add_middleware(
 )
 
 
+# GZip large responses (GLB / scene JSON) for clients that send
+# `Accept-Encoding: gzip` (axios + browsers do this by default and
+# transparently decompress). 2-3× transfer reduction for typical CAD
+# GLBs because the binary stream contains long runs of zeros (empty
+# attribute slots, padding) and floats with similar mantissas.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+
 @app.exception_handler(StarletteHTTPException)
 async def _starlette_http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
     """multipart 解析失败时给出可操作的提示（前端常误设 Content-Type）。"""
@@ -70,5 +79,6 @@ async def _fastapi_http_exception_handler(request: Request, exc: HTTPException) 
 app.include_router(health.router)
 app.include_router(convert.router, prefix="/api/v1")
 app.include_router(stp.router, prefix="/api/v1")
+app.include_router(stp_hierarchy.router, prefix="/api/v1")
 app.include_router(cad.router, prefix="/api/v1")
 app.include_router(ikfast.router, prefix="/api/v1")

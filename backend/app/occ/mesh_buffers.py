@@ -15,7 +15,7 @@ from OCC.Core.TopLoc import TopLoc_Location
 from OCC.Core.TopoDS import topods
 from OCC.Core.gp import gp_Pnt, gp_Vec
 
-from app.occ.discretize import wire_location_on_face, wire_to_polyline
+from app.occ.discretize import wire_to_polyline
 from app.occ.geometry_utils import face_surface_info, face_wires, iterate_faces
 from app.occ.mesh_export import _mesh_deflection, _mesh_shape
 from app.utils.raw_glb import CadGlbDrawable
@@ -96,8 +96,92 @@ def _solid_index_for_face(shape, face) -> int | None:
     return None
 
 
+# Diagnostic toggle: when True, _face_mesh_buffers logs the raw z range
+# of every face mesh. Used to verify the face-local vs world hypothesis
+# without polluting the console for single-solid models.
+# OFF by default — enabling it dumps thousands of lines for assemblies with
+# many faces and slows tessellation noticeably.
+_LOG_FACE_LOCAL = False
+_logged_face_local = 0
+
+
+def _log_face_local_z_range(face, triangulation) -> None:
+    global _logged_face_local
+    if not _LOG_FACE_LOCAL or _logged_face_local >= 6:
+        return
+    n = triangulation.NbNodes()
+    if n == 0:
+        return
+    zmin = zmax = triangulation.Node(1).Z()
+    for i in range(2, n + 1):
+        z = triangulation.Node(i).Z()
+        if z < zmin:
+            zmin = z
+        if z > zmax:
+            zmax = z
+    # Also dump face.Location() and tri_loc so we can correlate.
+    fl = face.Location()
+    tri_loc = TopLoc_Location()
+    BRep_Tool.Triangulation(face, tri_loc)
+    fl_id = fl.IsIdentity()
+    tl_id = tri_loc.IsIdentity()
+    print(
+        f"[STEP DEBUG] _face_mesh_buffers: face-local z=[{zmin:.2f},{zmax:.2f}] "
+        f"face.Loc.IsIdentity={fl_id} tri_loc.IsIdentity={tl_id}",
+        flush=True,
+    )
+    _logged_face_local += 1
+
+
+_logged_z_alignment = 0
+_logged_wire_world = 0
+
+
+def _log_face_wire_z_alignment(drawables: list[dict]) -> None:
+    global _logged_z_alignment
+    if _logged_z_alignment >= 3:
+        return
+    faces = {d["name"]: d for d in drawables if d.get("kind") == "mesh" and d["name"].startswith("face_")}
+    wires = {d["name"]: d for d in drawables if d.get("kind") == "line_strip"}
+    for fid, fmesh in faces.items():
+        if _logged_z_alignment >= 3:
+            break
+        fpos = fmesh.get("positions") or []
+        if not fpos:
+            continue
+        fz = fpos[2::3]
+        fmin, fmax = min(fz), max(fz)
+        # find first wire
+        wids = sorted(n for n in wires if n.startswith(f"wire_{fid}_"))
+        if not wids:
+            continue
+        wpos = wires[wids[0]].get("positions") or []
+        if not wpos:
+            continue
+        wz = wpos[2::3]
+        wmin, wmax = min(wz), max(wz)
+        aligned = (wmin <= fmax + 1e-3) and (wmax >= fmin - 1e-3)
+        print(
+            f"[STEP DEBUG] face<->wire z-align {fid}: face=[{fmin:.2f},{fmax:.2f}] "
+            f"wire({wids[0]})=[{wmin:.2f},{wmax:.2f}] aligned={aligned}",
+            flush=True,
+        )
+        _logged_z_alignment += 1
+
+
 def _face_mesh_buffers(face) -> tuple[list[float], list[int], list[float]] | None:
-    """Flat-shaded triangle soup for one B-Rep face (independent vertices per corner)."""
+    """Flat-shaded triangle soup for one B-Rep face (independent vertices per corner).
+
+    Vertices are written in the SAME world-space frame that
+    ``_wire_line_positions`` writes its wire vertices in. We transform the
+    triangulation nodes by ``BRep_Tool.Triangulation(face, loc).Location()``,
+    which OCCT sets to ``face.Location()`` — for STEP assemblies this
+    inherits all parent placements (root → compound → solid → shell →
+    face), so after Transformed the node is in the same world frame as
+    the wire polyline. Without this Transformed, the triangulation nodes
+    stay in the face-local frame and the wire frame drifts hundreds of
+    millimetres away.
+    """
     loc = TopLoc_Location()
     triangulation = BRep_Tool.Triangulation(face, loc)
     if triangulation is None:
@@ -109,7 +193,6 @@ def _face_mesh_buffers(face) -> tuple[list[float], list[int], list[float]] | Non
         pass
 
     has_normals = triangulation.HasNormals()
-    trsf = loc.Transformation()
     n_triangles = triangulation.NbTriangles()
     if n_triangles == 0:
         return None
@@ -117,15 +200,22 @@ def _face_mesh_buffers(face) -> tuple[list[float], list[int], list[float]] | Non
     face_verts: list[tuple[float, float, float]] = []
     face_nrms: list[tuple[float, float, float]] = []
 
+    _log_face_local_z_range(face, triangulation)
+
+    # triangulation.Node(i) is always in face-local coords.
+    # BRep_Tool.Triangulation sets |loc| = face.Location().
+    # We must always Transformed so the mesh ends up in world coords
+    # (same frame as wire vertices from BRepAdaptor_Curve.Value(u)).
+    tri_trsf = loc.Transformation()
+
     for i in range(1, triangulation.NbNodes() + 1):
         p = triangulation.Node(i)
-        if not loc.IsIdentity():
-            p = p.Transformed(trsf)
+        p = p.Transformed(tri_trsf)
         face_verts.append((p.X(), p.Y(), p.Z()))
         if has_normals:
             nn = triangulation.Normal(i)
             if not loc.IsIdentity():
-                nn = nn.Transformed(trsf)
+                nn = nn.Transformed(tri_trsf)
             face_nrms.append((nn.X(), nn.Y(), nn.Z()))
         else:
             face_nrms.append((0.0, 0.0, 0.0))
@@ -174,15 +264,38 @@ def _wire_line_positions(
     linear_deflection: float,
     angular_deflection: float,
 ) -> list[float]:
-    loc = wire_location_on_face(face, wire)
+    # Wire vertices must be in the SAME coordinate frame as the face mesh
+    # vertices. _face_mesh_buffers writes triangulation.Node(i).Transformed(face.Location())
+    # so both face mesh and wire vertices end up in world space.
+    # We must use the SAME location here: tri_loc (= face.Location() from
+    # BRep_Tool.Triangulation). Do NOT use wire_location_on_face() which
+    # additionally multiplies wire.Location() and causes divergence in
+    # assembly STEPs.
+    tri_loc = TopLoc_Location()
+    BRep_Tool.Triangulation(face, tri_loc)
     pts = wire_to_polyline(
         wire,
         linear_deflection,
         angular_deflection,
-        location=loc,
+        location=tri_loc,
     )
     if len(pts) < 2:
         return []
+    # DEBUG-only verbose print (was spamming the log for every wire on
+    # large assemblies; gated to first 3 wires total).
+    global _logged_wire_world
+    if _logged_wire_world < 3:
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        zs = [p[2] for p in pts]
+        print(
+            f"[STEP DEBUG] wire world: tri_loc.IsIdentity={tri_loc.IsIdentity()} "
+            f"x=[{min(xs):.1f},{max(xs):.1f}] "
+            f"y=[{min(ys):.1f},{max(ys):.1f}] "
+            f"z=[{min(zs):.1f},{max(zs):.1f}]",
+            flush=True,
+        )
+        _logged_wire_world += 1
     flat: list[float] = []
     for x, y, z in pts:
         flat.extend((x, y, z))
@@ -206,6 +319,13 @@ def shape_to_cad_drawables(
     solids = list(_iter_solids(shape))
     multi_solid = len(solids) > 1
     part_nodes: dict[int, str] = {}
+    # Pre-build part_nodes BEFORE the face loop so mesh/wire drawables can
+    # attach to the correct part group from the start (previously this map
+    # was filled only after the loop, leaving every face parented to "model"
+    # and producing an empty solid_X group in the GLB).
+    if multi_solid:
+        for si in range(len(solids)):
+            part_nodes[si] = f"solid_{si}"
 
     drawables: list[CadGlbDrawable] = []
     face_manifest: list[dict[str, Any]] = []
@@ -292,6 +412,11 @@ def shape_to_cad_drawables(
     if not drawables:
         raise ValueError("模型无三角面片，请减小 linear_deflection 或检查 STEP 文件")
 
+    # [STEP DEBUG] Cross-check: for the first 3 faces with both mesh and
+    # wire, log the world-space z range of each. They MUST overlap or
+    # the mesh and wire won't be aligned in the rendered scene.
+    _log_face_wire_z_alignment(drawables)
+
     # Always create a part group node so the GLB always has a meaningful
     # part-level hierarchy: single-solid → one group named by filename;
     # multi-solid → one group per solid named by STEP product name.
@@ -299,7 +424,6 @@ def shape_to_cad_drawables(
         part_id_to_name: dict[str, str] = {}
         for si in range(len(solids)):
             part_id = f"solid_{si}"
-            part_nodes[si] = part_id
             solid = solids[si]
             part_name = _solid_name(solid, part_id)
             part_id_to_name[part_id] = part_name
@@ -321,6 +445,11 @@ def shape_to_cad_drawables(
                     },
                 },
             )
+        # Rewrite every face/wire drawable whose parent was a part_id
+        # ("solid_X") to the resolved part_name used by the group node.
+        # The previous implementation only checked drawables written with
+        # parent="model" before the multi-solid block filled part_nodes,
+        # so this branch never matched and meshes stayed under "model".
         for d in drawables:
             parent = d.get("parent")
             if parent in part_id_to_name:

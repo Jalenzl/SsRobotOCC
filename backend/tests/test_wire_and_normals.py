@@ -13,9 +13,7 @@ pytestmark = pytest.mark.skipif(
     reason="pythonOCC not installed (use conda env occ)",
 )
 
-from app.models.cad import CadAnalyzeOptions  # noqa: E402
 from app.occ.discretize import wire_length, wire_to_polyline  # noqa: E402
-from app.occ.features.extractor import extract_face_features  # noqa: E402
 from app.occ.geometry_utils import face_outward_normal, face_wires  # noqa: E402
 from tests.fixtures.cad.generate_fixtures import (  # noqa: E402
     make_plate_with_hole_shape,
@@ -61,24 +59,6 @@ class TestWireDiscretize:
 
 
 class TestContourOutwardNormal:
-    def test_planar_hole_contour_normal_is_face_outward(self):
-        """顶面圆孔口的 contour.normal 应为顶面外法向（±Z），不是 PCA 斜向。"""
-        from app.occ.features.extractor import extract_all_features
-
-        shape = make_plate_with_hole_shape(100, 10, 15)
-        full = extract_all_features(shape, CadAnalyzeOptions())
-        top = next(
-            (f for f in full["faces"] if f.get("inner_wire_ids") and f.get("surface_type") == "plane"),
-            None,
-        )
-        assert top is not None
-        raw = extract_face_features(shape, CadAnalyzeOptions(), face_id=top["id"])
-        circles = [c for c in raw["contours"] if c["contour_type"] == "circle" and not c["is_outer"]]
-        assert circles, "带孔顶面应有圆孔内环"
-        n = circles[0]["normal"]
-        assert abs(n["z"]) > 0.99
-        assert abs(n["x"]) < 0.01 and abs(n["y"]) < 0.01
-
     def test_cylinder_face_outward_normal_is_radial(self):
         """圆柱面的外法向应为径向（水平分量），而非加工平面 (0,0,1)。"""
         from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeCylinder

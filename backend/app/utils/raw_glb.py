@@ -166,10 +166,11 @@ def cad_scene_to_glb_bytes(
         name = d["name"]
         if name in node_names:
             raise ValueError(f"duplicate drawable/node name: {name}")
-        parent = d.get("parent") or root_name
+        parent = d.get("parent")
         node_names.add(name)
-        node_names.add(parent)
-        children_of.setdefault(parent, []).append(name)
+        if parent:
+            node_names.add(parent)
+            children_of.setdefault(parent, []).append(name)
         children_of.setdefault(name, [])
         extras = d.get("extras")
         if extras:
@@ -273,16 +274,26 @@ def cad_scene_to_glb_bytes(
         if parent not in children_of:
             children_of[parent] = []
 
+    # ── cycle / duplicate detection ──────────────────────────────────────────
+    # Any node encountered twice during BFS is a cycle (glTF node hierarchy = DAG)
     ordered: list[str] = [root_name]
-    seen = {root_name}
-    queue = [root_name]
+    seen: set[str] = {root_name}
+    queue: list[str] = list(children_of.get(root_name, []))
     while queue:
         current = queue.pop(0)
+        if current in seen:
+            raise ValueError(
+                f"GLB node hierarchy contains a cycle at node '{current}'. "
+                f"Check the 'parent' field of all drawables — a node cannot "
+                f"appear as its own ancestor."
+            )
+        seen.add(current)
+        ordered.append(current)
         for child in sorted(children_of.get(current, [])):
             if child not in seen:
-                seen.add(child)
-                ordered.append(child)
                 queue.append(child)
+
+    # Orphan nodes that were never reachable from root
     for name in sorted(node_names - seen):
         ordered.append(name)
 
@@ -485,3 +496,282 @@ def mesh_to_glb_bytes(
             }
         ]
     )
+
+
+# ----------------------------------------------------------------------
+# 层级 GLB 导出：支持完整的 STEP 产品层级结构
+# ----------------------------------------------------------------------
+
+class HierarchicalMesh(TypedDict, total=False):
+    """层级化网格数据."""
+    name: str
+    part_id: str
+    positions: list[float]
+    indices: list[int]
+    normals: list[float]
+    matrix: list[float]
+    color: tuple[float, float, float] | None
+    extras: dict[str, Any]
+
+
+def hierarchical_scene_to_glb_bytes(
+    nodes: list[dict[str, Any]],
+    *,
+    scene_extras: dict[str, Any] | None = None,
+    root_name: str = "model",
+) -> bytes:
+    """将层级化场景导出为 GLB.
+
+    Args:
+        nodes: 节点列表，每个节点结构:
+            {
+                "name": str,              # 节点名称
+                "part_id": str,           # 唯一标识 (用于前端 metadata)
+                "parent": str | None,      # 父节点名称
+                "is_assembly": bool,       # 是否为装配体
+                "positions": list[float] | None,  # 顶点数据 (仅叶子节点)
+                "indices": list[int] | None,      # 索引数据 (仅叶子节点)
+                "normals": list[float] | None,    # 法线数据
+                "matrix": list[float] | None,     # 4x4 变换矩阵
+                "color": tuple | None,    # RGB 颜色
+                "extras": dict | None,   # 额外数据
+            }
+        scene_extras: 场景级别的额外数据 (如层级树信息)
+        root_name: 根节点名称
+
+    Returns:
+        GLB 字节数据
+    """
+    if not nodes:
+        raise ValueError("empty node list")
+
+    blob = bytearray()
+    accessors: list[dict[str, Any]] = []
+    buffer_views: list[dict[str, Any]] = []
+    meshes: list[dict[str, Any]] = []
+
+    materials = [_CAD_FACE_MATERIAL]
+
+    def _append_f32(data: list[float]) -> tuple[int, int]:
+        packed = struct.pack(f"<{len(data)}f", *[_finite_float(v) for v in data])
+        offset = len(blob)
+        blob.extend(packed)
+        return offset, len(packed)
+
+    def _append_u32(data: list[int]) -> tuple[int, int]:
+        packed = struct.pack(f"<{len(data)}I", *data)
+        offset = len(blob)
+        blob.extend(packed)
+        return offset, len(packed)
+
+    def _add_accessor(
+        offset: int,
+        length: int,
+        *,
+        component_type: int,
+        count: int,
+        type_name: str,
+        min_v: list[float] | None = None,
+        max_v: list[float] | None = None,
+    ) -> int:
+        view_idx = len(buffer_views)
+        buffer_views.append({"buffer": 0, "byteOffset": offset, "byteLength": length})
+        acc: dict[str, Any] = {
+            "bufferView": view_idx,
+            "componentType": component_type,
+            "count": count,
+            "type": type_name,
+        }
+        if min_v is not None:
+            acc["min"] = min_v
+        if max_v is not None:
+            acc["max"] = max_v
+        accessors.append(acc)
+        return len(accessors) - 1
+
+    # 收集所有节点名称并建立父子关系
+    node_names: set[str] = {root_name}
+    children_of: dict[str, list[str]] = {root_name: []}
+    node_mesh: dict[str, int] = {}
+    node_extras: dict[str, dict[str, Any]] = {}
+    node_matrix: dict[str, list[float]] = {}
+
+    for node in nodes:
+        name = node.get("name", f"node_{len(node_names)}")
+        parent = node.get("parent")
+
+        if name not in node_names:
+            node_names.add(name)
+        if parent and parent not in node_names:
+            node_names.add(parent)
+
+        if parent and parent != name:
+            children_of.setdefault(parent, []).append(name)
+        children_of.setdefault(name, [])
+
+        extras = node.get("extras")
+        if extras:
+            node_extras[name] = extras
+
+        matrix = node.get("matrix")
+        if matrix:
+            node_matrix[name] = [float(v) for v in matrix]
+
+        # 如果是叶子节点 (有几何数据)，创建 mesh
+        positions = node.get("positions") or []
+        indices = node.get("indices") or []
+        if len(positions) >= 6 and len(indices) >= 3:
+            normals = node.get("normals") or []
+            n_verts = len(positions) // 3
+            if normals is None or len(normals) != len(positions):
+                normals = [0.0, 0.0, 1.0] * n_verts
+
+            pos_off, pos_len = _append_f32(positions)
+            nrm_off, nrm_len = _append_f32(normals)
+            idx_off, idx_len = _append_u32(indices)
+            vmin, vmax = _bounds(positions)
+
+            pos_acc = _add_accessor(
+                pos_off, pos_len,
+                component_type=5126, count=n_verts, type_name="VEC3",
+                min_v=vmin, max_v=vmax,
+            )
+            nrm_acc = _add_accessor(
+                nrm_off, nrm_len,
+                component_type=5126, count=n_verts, type_name="VEC3",
+            )
+            idx_acc = _add_accessor(
+                idx_off, idx_len,
+                component_type=5125, count=len(indices), type_name="SCALAR",
+            )
+
+            mesh_idx = len(meshes)
+            mesh_entry: dict[str, Any] = {
+                "name": name,
+                "primitives": [
+                    {
+                        "attributes": {"POSITION": pos_acc, "NORMAL": nrm_acc},
+                        "indices": idx_acc,
+                        "material": 0,
+                        "mode": 4,
+                    }
+                ],
+            }
+            meshes.append(mesh_entry)
+            node_mesh[name] = mesh_idx
+
+    # 确保所有节点都在 children_of 中
+    for name in node_names:
+        children_of.setdefault(name, [])
+
+    # BFS 排序节点 (保证父节点在子节点之前) + 循环引用检测
+    # 任何节点在遍历中第二次出现即为循环（glTF node hierarchy 必须是 DAG）
+    ordered: list[str] = [root_name]
+    seen: set[str] = {root_name}
+    queue: list[str] = list(children_of.get(root_name, []))
+    while queue:
+        current = queue.pop(0)
+        if current in seen:
+            raise ValueError(
+                f"GLB node hierarchy contains a cycle at node '{current}'. "
+                f"Check the 'parent' field of all nodes — a node cannot "
+                f"appear as its own ancestor."
+            )
+        seen.add(current)
+        ordered.append(current)
+        for child in sorted(children_of.get(current, [])):
+            if child not in seen:
+                queue.append(child)
+    # 处理孤儿节点
+    for name in sorted(node_names - seen):
+        ordered.append(name)
+
+    # 构建 glTF nodes
+    name_to_idx = {name: idx for idx, name in enumerate(ordered)}
+    gltf_nodes: list[dict[str, Any]] = []
+    for name in ordered:
+        nd: dict[str, Any] = {"name": name}
+        if name in node_mesh:
+            nd["mesh"] = node_mesh[name]
+        kids = children_of.get(name) or []
+        if kids:
+            nd["children"] = [name_to_idx[c] for c in kids if c in name_to_idx]
+        if name in node_extras:
+            nd["extras"] = node_extras[name]
+        if name in node_matrix:
+            nd["matrix"] = node_matrix[name]
+        gltf_nodes.append(nd)
+
+    if not gltf_nodes:
+        raise ValueError("no nodes in scene")
+
+    # 确保根节点在 scenes 中
+    if root_name not in name_to_idx:
+        root_name = ordered[0]
+
+    scene: dict[str, Any] = {"nodes": [name_to_idx[root_name]]}
+    if scene_extras:
+        scene["extras"] = scene_extras
+
+    gltf: dict[str, Any] = {
+        "asset": {"version": "2.0", "generator": "cad-backend-hierarchical-glb"},
+        "scene": 0,
+        "scenes": [scene],
+        "nodes": gltf_nodes,
+        "meshes": meshes,
+        "accessors": accessors,
+        "bufferViews": buffer_views,
+        "buffers": [{"byteLength": len(blob)}],
+        "materials": materials,
+    }
+
+    json_data = json.dumps(gltf, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return pack_glb(json_data, bytes(blob))
+
+
+def hierarchical_meshes_to_glb_bytes(
+    meshes: list[HierarchicalMesh],
+    *,
+    scene_extras: dict[str, Any] | None = None,
+) -> bytes:
+    """将层级化网格列表导出为 GLB.
+
+    简化版接口，直接从网格数据构建层级。
+
+    Args:
+        meshes: 网格列表，每项包含 name, part_id, positions, indices, normals, matrix 等
+        scene_extras: 场景额外数据
+
+    Returns:
+        GLB 字节数据
+    """
+    nodes: list[dict[str, Any]] = []
+    name_to_parent: dict[str, str] = {}
+
+    for mesh in meshes:
+        name = mesh.get("name", f"mesh_{len(nodes)}")
+        part_id = mesh.get("part_id", name)
+        parent = mesh.get("parent")
+
+        node: dict[str, Any] = {
+            "name": name,
+            "part_id": part_id,
+            "parent": parent,
+            "positions": mesh.get("positions"),
+            "indices": mesh.get("indices"),
+            "normals": mesh.get("normals"),
+            "matrix": mesh.get("matrix"),
+            "extras": {
+                "cad": {
+                    "role": "part",
+                    "part_id": part_id,
+                }
+            },
+        }
+
+        if mesh.get("color"):
+            node["color"] = mesh["color"]
+
+        nodes.append(node)
+
+    return hierarchical_scene_to_glb_bytes(nodes, scene_extras=scene_extras)
