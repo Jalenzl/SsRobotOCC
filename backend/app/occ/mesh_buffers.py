@@ -96,79 +96,6 @@ def _solid_index_for_face(shape, face) -> int | None:
     return None
 
 
-# Diagnostic toggle: when True, _face_mesh_buffers logs the raw z range
-# of every face mesh. Used to verify the face-local vs world hypothesis
-# without polluting the console for single-solid models.
-# OFF by default — enabling it dumps thousands of lines for assemblies with
-# many faces and slows tessellation noticeably.
-_LOG_FACE_LOCAL = False
-_logged_face_local = 0
-
-
-def _log_face_local_z_range(face, triangulation) -> None:
-    global _logged_face_local
-    if not _LOG_FACE_LOCAL or _logged_face_local >= 6:
-        return
-    n = triangulation.NbNodes()
-    if n == 0:
-        return
-    zmin = zmax = triangulation.Node(1).Z()
-    for i in range(2, n + 1):
-        z = triangulation.Node(i).Z()
-        if z < zmin:
-            zmin = z
-        if z > zmax:
-            zmax = z
-    # Also dump face.Location() and tri_loc so we can correlate.
-    fl = face.Location()
-    tri_loc = TopLoc_Location()
-    BRep_Tool.Triangulation(face, tri_loc)
-    fl_id = fl.IsIdentity()
-    tl_id = tri_loc.IsIdentity()
-    print(
-        f"[STEP DEBUG] _face_mesh_buffers: face-local z=[{zmin:.2f},{zmax:.2f}] "
-        f"face.Loc.IsIdentity={fl_id} tri_loc.IsIdentity={tl_id}",
-        flush=True,
-    )
-    _logged_face_local += 1
-
-
-_logged_z_alignment = 0
-_logged_wire_world = 0
-
-
-def _log_face_wire_z_alignment(drawables: list[dict]) -> None:
-    global _logged_z_alignment
-    if _logged_z_alignment >= 3:
-        return
-    faces = {d["name"]: d for d in drawables if d.get("kind") == "mesh" and d["name"].startswith("face_")}
-    wires = {d["name"]: d for d in drawables if d.get("kind") == "line_strip"}
-    for fid, fmesh in faces.items():
-        if _logged_z_alignment >= 3:
-            break
-        fpos = fmesh.get("positions") or []
-        if not fpos:
-            continue
-        fz = fpos[2::3]
-        fmin, fmax = min(fz), max(fz)
-        # find first wire
-        wids = sorted(n for n in wires if n.startswith(f"wire_{fid}_"))
-        if not wids:
-            continue
-        wpos = wires[wids[0]].get("positions") or []
-        if not wpos:
-            continue
-        wz = wpos[2::3]
-        wmin, wmax = min(wz), max(wz)
-        aligned = (wmin <= fmax + 1e-3) and (wmax >= fmin - 1e-3)
-        print(
-            f"[STEP DEBUG] face<->wire z-align {fid}: face=[{fmin:.2f},{fmax:.2f}] "
-            f"wire({wids[0]})=[{wmin:.2f},{wmax:.2f}] aligned={aligned}",
-            flush=True,
-        )
-        _logged_z_alignment += 1
-
-
 def _face_mesh_buffers(face) -> tuple[list[float], list[int], list[float]] | None:
     """Flat-shaded triangle soup for one B-Rep face (independent vertices per corner).
 
@@ -199,8 +126,6 @@ def _face_mesh_buffers(face) -> tuple[list[float], list[int], list[float]] | Non
 
     face_verts: list[tuple[float, float, float]] = []
     face_nrms: list[tuple[float, float, float]] = []
-
-    _log_face_local_z_range(face, triangulation)
 
     # triangulation.Node(i) is always in face-local coords.
     # BRep_Tool.Triangulation sets |loc| = face.Location().
@@ -281,21 +206,6 @@ def _wire_line_positions(
     )
     if len(pts) < 2:
         return []
-    # DEBUG-only verbose print (was spamming the log for every wire on
-    # large assemblies; gated to first 3 wires total).
-    global _logged_wire_world
-    if _logged_wire_world < 3:
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        zs = [p[2] for p in pts]
-        print(
-            f"[STEP DEBUG] wire world: tri_loc.IsIdentity={tri_loc.IsIdentity()} "
-            f"x=[{min(xs):.1f},{max(xs):.1f}] "
-            f"y=[{min(ys):.1f},{max(ys):.1f}] "
-            f"z=[{min(zs):.1f},{max(zs):.1f}]",
-            flush=True,
-        )
-        _logged_wire_world += 1
     flat: list[float] = []
     for x, y, z in pts:
         flat.extend((x, y, z))
@@ -313,6 +223,13 @@ def shape_to_cad_drawables(
 
     Face index order matches ``iterate_faces`` / ``/cad/analyze`` (``face_0`` …).
     ``filename`` is used as the single-part group name when there is only one Solid.
+
+    坐标约定：face mesh 顶点 + wire 顶点都在「shape 所在的世界坐标系」下
+    （_face_mesh_buffers 会用 ``face.Location()`` 把 face-local 三角形顶点
+    转到世界；wire 顶点来自 ``BRepAdaptor_Curve.Value(u)``，调用方传
+    入 ``tri_loc = face.Location()``）。因此每个 part group 的 matrix 必须
+    **是 identity**——再乘一次 ``solid.Location()`` 会把面片整体二次平移。
+    solid 的真实位置仍然通过 ``extras.cad.matrix`` 暴露给前端。
     """
     _mesh_shape(shape, linear_deflection, angular_deflection)
 
@@ -412,14 +329,14 @@ def shape_to_cad_drawables(
     if not drawables:
         raise ValueError("模型无三角面片，请减小 linear_deflection 或检查 STEP 文件")
 
-    # [STEP DEBUG] Cross-check: for the first 3 faces with both mesh and
-    # wire, log the world-space z range of each. They MUST overlap or
-    # the mesh and wire won't be aligned in the rendered scene.
-    _log_face_wire_z_alignment(drawables)
-
     # Always create a part group node so the GLB always has a meaningful
     # part-level hierarchy: single-solid → one group named by filename;
     # multi-solid → one group per solid named by STEP product name.
+    #
+    # 关键：face mesh 顶点已经在世界坐标系下，part group matrix 必须
+    # 是 identity（不能再乘 solid.Location()，否则装配体各零件会
+    # 二次平移、看起来相互分离）。solid 的真实位置仍通过 extras 暴露
+    # 给前端（matrix 字段）。
     if multi_solid:
         part_id_to_name: dict[str, str] = {}
         for si in range(len(solids)):
@@ -433,7 +350,7 @@ def shape_to_cad_drawables(
                     "kind": "group",
                     "name": part_name,
                     "parent": "model",
-                    "matrix": _location_to_matrix(solid.Location()),
+                    "matrix": _identity_matrix(),
                     "extras": {
                         "cad": {
                             "role": "part",
@@ -441,6 +358,7 @@ def shape_to_cad_drawables(
                             "part_name": part_name,
                             "solid_index": si,
                             "face_ids": parts_manifest.get(part_id, []),
+                            "matrix": _location_to_matrix(solid.Location()),
                         }
                     },
                 },
@@ -625,10 +543,21 @@ def shape_to_component_meshes(
     exp = TopExp_Explorer(shape, TopAbs_SOLID)
     solid_index = 0
     while exp.More():
+        # ``shape`` 在这个路径下可能来自 XDE ``GetShape(label)``（已经
+        # 把 label 的累积 Location 应用到几何里了）。在装配体里，每个
+        # solid 自带 ``Location()`` 描述它相对 compound 的位移；如果
+        # 直接拿去 tessellate，得到的顶点已经处于 world 坐标系，再
+        # 把 ``solid.Location()`` 写到节点 ``matrix`` 就会双倍叠加，
+        # 装配体表现为「零件相互分离」。
+        # 正确做法：先 ``Located(TopLoc_Location())`` 把 solid 自身的
+        # Location 剥掉再 tessellate（顶点退到 solid-local 坐标系），
+        # 节点 matrix 仍保留 ``solid.Location()``，渲染时
+        # ``vertex × matrix`` = world。
         solid = topods.Solid(exp.Current())
+        local_solid = solid.Located(TopLoc_Location())
         loc = solid.Location()
         pos, idx, nrm = _merged_mesh_buffers_for_shape(
-            solid, linear_deflection, angular_deflection, remesh=False
+            local_solid, linear_deflection, angular_deflection, remesh=False
         )
         components.append(
             {
@@ -649,8 +578,9 @@ def shape_to_component_meshes(
     shell_index = 0
     while shell_exp.More():
         shell = topods.Shell(shell_exp.Current())
+        local_shell = shell.Located(TopLoc_Location())
         pos, idx, nrm = _merged_mesh_buffers_for_shape(
-            shell, linear_deflection, angular_deflection, remesh=False
+            local_shell, linear_deflection, angular_deflection, remesh=False
         )
         components.append(
             {
@@ -658,7 +588,7 @@ def shape_to_component_meshes(
                 "positions": pos,
                 "indices": idx,
                 "normals": nrm,
-                "matrix": _identity_matrix(),
+                "matrix": _location_to_matrix(shell.Location()),
             }
         )
         shell_index += 1
@@ -667,16 +597,18 @@ def shape_to_component_meshes(
     if components:
         return components
 
+    local_shape = shape.Located(TopLoc_Location()) if shape is not None else None
     pos, idx, nrm = _merged_mesh_buffers_for_shape(
-        shape, linear_deflection, angular_deflection, remesh=False
+        local_shape, linear_deflection, angular_deflection, remesh=False
     )
+    loc = shape.Location() if shape is not None else None
     return [
         {
             "name": _solid_name(shape, "Part_1"),
             "positions": pos,
             "indices": idx,
             "normals": nrm,
-            "matrix": _identity_matrix(),
+            "matrix": _location_to_matrix(loc) if loc is not None else _identity_matrix(),
         }
     ]
 

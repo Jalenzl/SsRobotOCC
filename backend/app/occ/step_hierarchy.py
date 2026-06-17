@@ -16,6 +16,7 @@ from typing import Any
 from OCC.Core.IFSelect import IFSelect_RetDone
 from OCC.Core.TopAbs import TopAbs_SOLID
 from OCC.Core.TopExp import TopExp_Explorer
+from OCC.Core.TopLoc import TopLoc_Location
 from OCC.Core.TopoDS import TopoDS_Shape, topods
 
 try:
@@ -104,13 +105,18 @@ class StepHierarchyReader:
                 )
             root.is_assembly = True
             for i, solid in enumerate(fallback_parts):
+                # 关键：solid 自身可能还携带 Location（XDE 在
+                # label 上挂的 location 会沿拓扑传播到 solid），
+                # 这里必须 strip 掉，否则 tessellate 后顶点 + 节点
+                # matrix 会双倍叠加。
+                local_solid = self._strip_location(solid)
                 root.children.append(
                     HierarchyNode(
                         name=f"{root.name}_part_{i}",
                         part_id=f"{root.part_id}_p{i}",
                         label_path="",
                         location_matrix=self._location_to_matrix(solid.Location()),
-                        shape=solid,
+                        shape=local_solid,
                     )
                 )
             shapes = fallback_parts
@@ -126,13 +132,16 @@ class StepHierarchyReader:
                 is_assembly=True,
             )
             for i, solid in enumerate(solids):
+                # read_shapes 返回的 solid 同样可能携带 Location，
+                # strip 后再下发。
+                local_solid = self._strip_location(solid)
                 root.children.append(
                     HierarchyNode(
                         name=f"{root.name}_part_{i}",
                         part_id=f"{root.part_id}_p{i}",
                         label_path="",
                         location_matrix=self._location_to_matrix(solid.Location()),
-                        shape=solid,
+                        shape=local_solid,
                     )
                 )
             return root, solids
@@ -161,10 +170,34 @@ class StepHierarchyReader:
                 exp.Next()
         return solids
 
+    def _strip_location(self, shape: TopoDS_Shape | None) -> TopoDS_Shape | None:
+        """Return a copy of the shape with its accumulated Location removed.
+
+        ``XCAFDoc_ShapeTool.GetShape(label)`` returns the shape **with the
+        label's accumulated transform already applied** (i.e. in the
+        assembly's world frame). If we then tessellate that shape and also
+        store the label's Location as the node's matrix, every vertex gets
+        the transform applied twice — the part ends up far from its true
+        position and the assembly looks like its components are flying
+        apart. To get a correct render we must keep the matrix (so the
+        front-end can still query position / rotation) but tessellate the
+        shape **without** its Location, i.e. in the label's local frame.
+        Vertices are then ``local × matrix`` = world.
+        """
+        if shape is None or shape.IsNull():
+            return shape
+        try:
+            return shape.Located(TopLoc_Location())
+        except Exception:
+            return shape
+
     def read_shapes(self, data: bytes, filename_hint: str) -> list[TopoDS_Shape]:
         """非 XDE 兜底：用 ``STEPControl_Reader`` 直接取 STEP 中的所有 Solid.
 
         在 XDE 完全失败（root 为空 + shapes 为空）时使用。
+
+        注意：``read_step_bytes`` 返回的 shape 处于世界坐标；我们这里
+        要拿到每个 Solid 的局部坐标，调用方会在循环里 ``_strip_location``。
         """
         from app.occ.loader import read_step_bytes
 
@@ -196,6 +229,23 @@ class StepHierarchyReader:
         root = self._build_tree(shape_tool, color_tool, shapes)
         return root, shapes
 
+    def _mat_multiply(
+        self,
+        a: list[float],
+        b: list[float],
+    ) -> list[float]:
+        """Multiply two 4x4 matrices stored as 16-element column-major lists."""
+        # glTF stores matrices in column-major order: m[0..3] = column 0,
+        # m[4..7] = column 1, m[8..11] = column 2, m[12..15] = column 3.
+        out = [0.0] * 16
+        for col in range(4):
+            for row in range(4):
+                s = 0.0
+                for k in range(4):
+                    s += a[k * 4 + row] * b[col * 4 + k]
+                out[col * 4 + row] = s
+        return out
+
     def _build_tree(
         self,
         shape_tool: "XCAFDoc_ShapeTool",
@@ -204,6 +254,7 @@ class StepHierarchyReader:
         label=None,
         parent_path: str = "",
         depth: int = 0,
+        cumulative_matrix: list[float] | None = None,
     ) -> HierarchyNode | None:
         if label is None:
             labels = TDF_LabelSequence()
@@ -216,7 +267,14 @@ class StepHierarchyReader:
         part_id = self._make_part_id(label, depth)
 
         loc = shape_tool.GetLocation(label)
-        matrix = self._location_to_matrix(loc)
+        local_matrix = self._location_to_matrix(loc)
+
+        # 把 parent 累积的矩阵乘上本 label 的 local transform，
+        # 才是这个 label 上的 shape 真正应该出现的世界 transform。
+        # 当 ``cumulative_matrix`` 为 None（递归顶层）时，父级视为 identity。
+        if cumulative_matrix is None:
+            cumulative_matrix = self._identity_matrix_list()
+        node_matrix = self._mat_multiply(cumulative_matrix, local_matrix)
 
         color = self._get_label_color(label, color_tool)
 
@@ -224,7 +282,7 @@ class StepHierarchyReader:
             name=name,
             part_id=part_id,
             label_path=str(parent_path),
-            location_matrix=matrix,
+            location_matrix=node_matrix,
             color=color,
         )
 
@@ -242,6 +300,7 @@ class StepHierarchyReader:
                     sub_label,
                     f"{parent_path}/{name}",
                     depth + 1,
+                    node_matrix,
                 )
                 if child_node:
                     node.children.append(child_node)
@@ -250,6 +309,15 @@ class StepHierarchyReader:
         shape = shape_tool.GetShape(label)
         if shape.IsNull():
             return node
+
+        # 关键：``GetShape(label)`` 返回的 shape **已经**把 label 的
+        # 累积 Location 应用到几何里了（XDE 语义）。如果直接拿去
+        # tessellate，再把 ``label.GetLocation()`` 写到节点的
+        # ``location_matrix``，每个顶点会被矩阵双倍变换，导致
+        # 装配体各零件相互错位。这里把 Location 剥掉，只保留
+        # 节点 ``location_matrix``（已是 parent_cumulative × local
+        # 的累积矩阵），最终 ``vertex × matrix`` 才等于真实世界坐标。
+        shape = self._strip_location(shape)
 
         # 兜底 1：XDE 在当前 label 上没有组件，但 label 直接挂了一个 shape
         # （典型场景：AP214 把装配体作为 compound 直接挂在 root label，
@@ -264,15 +332,23 @@ class StepHierarchyReader:
         if len(solids) > 1:
             node.is_assembly = True
             for si, solid in enumerate(solids):
+                # 关键：solid 自身可能还带 Location（compound 里各
+                # solid 之间的相对位移），必须 strip 后顶点才能进
+                # 入 solid-local 坐标系；矩阵要包含 parent 累积 ×
+                # solid 自身的 Location，才是 sub-solid 的世界 transform。
+                local_solid = self._strip_location(solid)
+                sub_matrix = self._mat_multiply(
+                    node_matrix, self._location_to_matrix(solid.Location())
+                )
                 sub = HierarchyNode(
                     name=f"{name}_part_{si}",
                     part_id=f"{part_id}_s{si}",
                     label_path=f"{parent_path}/{name}",
-                    location_matrix=self._location_to_matrix(solid.Location()),
-                    shape=solid,
+                    location_matrix=sub_matrix,
+                    shape=local_solid,
                 )
                 node.children.append(sub)
-                shapes.append(solid)
+                shapes.append(local_solid)
             node.shape = None
             return node
 
@@ -286,6 +362,15 @@ class StepHierarchyReader:
         node.shape = shape
         shapes.append(shape)
         return node
+
+    @staticmethod
+    def _identity_matrix_list() -> list[float]:
+        return [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ]
 
     def _get_label_name(self, label, depth: int, parent_path: str) -> str:
         """获取标签的名称."""
