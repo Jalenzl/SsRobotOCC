@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import cors_allow_credentials, cors_allow_origins_raw, ensure_runtime_dirs
-from app.routers import cad, convert, health, ikfast, stp, stp_hierarchy
+from app.routers import cad, convert, feature, health, ikfast, stp, stp_hierarchy
 
 ensure_runtime_dirs()
 
@@ -81,4 +81,5 @@ app.include_router(convert.router, prefix="/api/v1")
 app.include_router(stp.router, prefix="/api/v1")
 app.include_router(stp_hierarchy.router, prefix="/api/v1")
 app.include_router(cad.router, prefix="/api/v1")
+app.include_router(feature.router, prefix="/api/v1")
 app.include_router(ikfast.router, prefix="/api/v1")

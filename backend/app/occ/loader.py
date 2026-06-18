@@ -35,6 +35,29 @@ def read_step_file(path: str | Path) -> "TopoDS_Shape":
     return _normalize_shape(shape)
 
 
+def write_step_bytes(shape: "TopoDS_Shape", filename_hint: str = "model.step") -> bytes:
+    """Serialize a TopoDS_Shape to STEP bytes. Inverse of ``read_step_bytes``.
+
+    Used by tests that need to inject a custom shape (e.g. a multi-solid
+    compound) into the upload pipeline.
+    """
+    from OCC.Core.STEPControl import STEPControl_Writer
+    from OCC.Core.IFSelect import IFSelect_RetDone
+
+    suffix = ".step" if filename_hint.lower().endswith(".step") else ".stp"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        path = tmp.name
+    try:
+        writer = STEPControl_Writer()
+        writer.Transfer(shape, 0)
+        status = writer.Write(path)
+        if status != IFSelect_RetDone:
+            raise ValueError(f"STEP write failed: {path}")
+        return Path(path).read_bytes()
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
 def _count_subshapes(shape: "TopoDS_Shape", kind) -> int:
     n = 0
     exp = TopExp_Explorer(shape, kind)
