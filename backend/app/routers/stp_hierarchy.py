@@ -23,7 +23,7 @@ from app.utils.file_handler import (
 )
 from app.utils.step_bytes import is_step_bytes, step_filename_hint
 
-_BACKEND_ROOT = Path(__file__).parent.parent.resolve()
+_BACKEND_ROOT = Path(__file__).parent.parent.parent.resolve()
 
 
 router = APIRouter(prefix="/stp", tags=["stp-hierarchy"])
@@ -93,6 +93,13 @@ async def convert_stp_to_hierarchical_glb(
         "hierarchy",
         description="转换模式: hierarchy=保留完整层级(需XDE), flat=扁平化零件层级",
     ),
+    per_face: bool = Query(
+        False,
+        description=(
+            "每个面生成独立 mesh（用于选中面做特征识别）。"
+            "注意：面数很多时 GLB 会变大，建议对小模型或需单面分析时开启。"
+        ),
+    ),
     merge_faces: bool | None = Query(
         None,
         description=(
@@ -137,20 +144,22 @@ async def convert_stp_to_hierarchical_glb(
     if merge_faces is None:
         merge_faces = len(raw) >= 5 * 1024 * 1024 or mode == "flat"
 
-    # GLB cache: keyed by STEP content hash + conversion params. Re-uploading
-    # the same file (or re-converting with the same params) becomes instant.
-    model_id = cad_cache.compute_model_id(raw)
-    if not bypass_cache:
-        cad_cache.store_step(raw, hint or "model.stp")
-        from app.services import glb_cache
+        # GLB cache: keyed by STEP content hash + conversion params. Re-uploading
+        # the same file (or re-converting with the same params) becomes instant.
+        model_id = cad_cache.compute_model_id(raw)
+        cached = None
+        if not bypass_cache:
+            cad_cache.store_step(raw, hint or "model.stp")
+            from app.services import glb_cache
 
-        cached = glb_cache.get_cached(
-            model_id,
-            linear_deflection=linear_deflection,
-            angular_deflection=angular_deflection,
-            merge_faces=merge_faces,
-            mode=mode,
-        )
+            cached = glb_cache.get_cached(
+                model_id,
+                linear_deflection=linear_deflection,
+                angular_deflection=angular_deflection,
+                merge_faces=merge_faces,
+                mode=mode,
+                per_face=per_face,  # per_face changes GLB structure, must be part of cache key
+            )
         if cached is not None:
             return _glb_response(cached, hint)
 
@@ -166,6 +175,7 @@ async def convert_stp_to_hierarchical_glb(
                 linear_deflection=linear_deflection,
                 angular_deflection=angular_deflection,
                 merge_faces=merge_faces,
+                per_face=per_face,
             )
         else:
             glb = _convert_flat(
@@ -192,6 +202,7 @@ async def convert_stp_to_hierarchical_glb(
                 angular_deflection=angular_deflection,
                 merge_faces=merge_faces,
                 mode=mode,
+                per_face=per_face,
             )
         except Exception:
             pass  # cache failures must never block the response
@@ -214,6 +225,7 @@ def _convert_with_hierarchy(
     linear_deflection: float,
     angular_deflection: float,
     merge_faces: bool = False,
+    per_face: bool = False,
 ) -> bytes:
     """使用 XDE 读取层级并生成层级化 GLB.
 
@@ -234,18 +246,23 @@ def _convert_with_hierarchy(
         step_path = Path(td) / f"input{suffix}"
         glb_path = Path(td) / "output.glb"
         meta_path = Path(td) / "meta.json"
+        script_path = Path(td) / "hierarchy_worker.py"
         step_path.write_bytes(data)
+
+        # Write worker script to a temp .py file (avoids encoding issues with
+        # `python -c "..."` on Windows command-line argument encoding).
+        script_path.write_text(_HIERARCHY_WORKER_SCRIPT, encoding="utf-8")
 
         env = __import__("os").environ.copy()
         env["PYTHONNOUSERSITE"] = "1"
+        env["PYTHONUTF8"] = "1"
 
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
         proc = subprocess.run(
             [
                 sys.executable,
-                "-c",
-                _HIERARCHY_WORKER_SCRIPT,
+                str(script_path),
                 str(step_path),
                 str(glb_path),
                 str(meta_path),
@@ -254,6 +271,7 @@ def _convert_with_hierarchy(
                 str(_BACKEND_ROOT),
                 filename,
                 "1" if merge_faces else "0",
+                "1" if per_face else "0",
             ],
             capture_output=True,
             env=env,
@@ -359,111 +377,189 @@ def main():
     backend_root = Path(sys.argv[6])
     filename = sys.argv[7] if len(sys.argv) > 7 else step_path.name
     merge_faces = (len(sys.argv) > 8 and sys.argv[8] == "1")
+    per_face = (len(sys.argv) > 9 and sys.argv[9] == "1")
 
     # Add backend to path
     if str(backend_root) not in sys.path:
         sys.path.insert(0, str(backend_root))
 
     from app.occ.step_hierarchy import StepHierarchyReader
-    from app.occ.mesh_buffers import _merged_mesh_buffers_for_shape
-    from app.utils.raw_glb import hierarchical_scene_to_glb_bytes, validate_glb_bytes
+    from app.occ.mesh_buffers import (
+        _merged_mesh_buffers_for_shape,
+        shape_to_cad_drawables,
+    )
+    from app.utils.raw_glb import (
+        hierarchical_scene_to_glb_bytes,
+        cad_scene_to_glb_bytes,
+        validate_glb_bytes,
+    )
 
     data = step_path.read_bytes()
 
     reader = StepHierarchyReader()
     root, shapes = reader.read(data, filename)
 
-    # 构建层级化节点列表，parent 用实际父节点名称（root 为 None → "model"）
-    from collections import deque
+    if per_face:
+        # Per-face mode: each face becomes an independent mesh (for single-face feature analysis).
+        # Each Part's faces are expanded into individual drawables.
+        # Face mesh parent = "Part_<n>" group (consistent with backend face_id = "face_<n>").
+        from collections import deque
 
-    nodes: list[dict] = []
-    node_map: dict[str, dict] = {}
-    used_names: dict[str, int] = {}  # track used names to ensure uniqueness
-    queue: deque[tuple] = deque()
+        nodes: list[dict] = []
+        used_names: dict[str, int] = {}
+        queue: deque[tuple] = deque()
 
-    def unique_name(name: str) -> str:
-        count = used_names.get(name, 0)
-        used_names[name] = count + 1
-        if count == 0:
-            return name
-        return f"{name}_{count}"
+        def unique_name(name: str) -> str:
+            count = used_names.get(name, 0)
+            used_names[name] = count + 1
+            return name if count == 0 else f"{name}_{count}"
 
-    def process_node(node, parent_unique):
-        result = {
-            "name": unique_name(node.name),
-            "parent": parent_unique,
-            "matrix": node.location_matrix,
-            "extras": {
-                "cad": {
-                    "role": "assembly" if node.is_assembly else "part",
-                    "part_id": node.part_id,
-                }
-            },
+        def process_node(node, parent_unique):
+            result = {
+                "name": unique_name(node.name),
+                "parent": parent_unique,
+                "matrix": node.location_matrix,
+                "kind": "group",  # container node, no geometry; glTF writer skips it
+                "extras": {
+                    "cad": {
+                        "role": "assembly" if node.is_assembly else "part",
+                        "part_id": node.part_id,
+                    }
+                },
+            }
+            if node.color:
+                result["color"] = list(node.color)
+            return result
+
+        def add_shape_faces(shape, parent_group_name):
+            # Expand shape faces into individual mesh drawables (parent = part group).
+            if shape is None:
+                return
+            try:
+                drawables, _, _ = shape_to_cad_drawables(
+                    shape,
+                    linear_deflection=linear_deflection,
+                    angular_deflection=angular_deflection,
+                    filename=filename,
+                )
+                for d in drawables:
+                    nodes.append(d)
+            except Exception as e:
+                print(f"Warning: failed to add shape faces for {parent_group_name}: {e}", file=sys.stderr)
+
+        # root node (kind="group" avoids collision with same-named drawable mesh)
+        root_data = process_node(root, None)
+        nodes.append(root_data)
+
+        # root itself may have a shape (e.g. plate_with_slot_100 where root.is_assembly=False)
+        if root.shape is not None:
+            add_shape_faces(root.shape, root_data["name"])
+
+        # BFS traverse all child nodes
+        for child in root.children:
+            queue.append((child, root_data["name"]))
+
+        while queue:
+            node, parent_name = queue.popleft()
+            node_data = process_node(node, parent_name)
+            nodes.append(node_data)
+
+            if node.shape is not None:
+                add_shape_faces(node.shape, node_data["name"])
+
+            for child in node.children:
+                queue.append((child, node_data["name"]))
+
+        hierarchy_meta = {
+            "schema": "robotlaser.step.hierarchy/v1",
+            "filename": filename,
+            "total_parts": len([n for n in nodes if n.get("positions")]),
+            "total_nodes": len(nodes),
         }
-        if node.color:
-            result["color"] = list(node.color)
-        return result
 
-    def mesh_node(node_data, shape):
-        if shape is None:
-            return
-        try:
-            pos, idx, nrm = _merged_mesh_buffers_for_shape(
-                shape,
-                linear_deflection,
-                angular_deflection,
-                remesh=True,
-            )
-            node_data["positions"] = pos
-            node_data["indices"] = idx
-            node_data["normals"] = nrm
-        except Exception as e:
-            print(f"Warning: failed to mesh {node_data['name']}: {e}", file=sys.stderr)
+        glb = cad_scene_to_glb_bytes(
+            nodes,
+            scene_extras={"cad": hierarchy_meta},
+            root_name=root.name,
+        )
+    else:
+        # Merged-face mode (default): each Part = one merged mesh.
+        from collections import deque
 
-    # root 单独处理
-    root_data = process_node(root, None)
-    node_map[root.part_id] = root_data
-    nodes.append(root_data)
+        nodes: list[dict] = []
+        node_map: dict[str, dict] = {}
+        used_names: dict[str, int] = {}
+        queue: deque[tuple] = deque()
 
-    # root 自身的 shape 也要 mesh 化（之前漏了这一步，导致 root 是几何装配
-    # 时 GLB 没有 mesh）
-    mesh_node(root_data, root.shape)
+        def unique_name(name: str) -> str:
+            count = used_names.get(name, 0)
+            used_names[name] = count + 1
+            return name if count == 0 else f"{name}_{count}"
 
-    # 将 root 的子节点入队
-    for child in root.children:
-        queue.append((child, root_data["name"]))
+        def process_node(node, parent_unique):
+            result = {
+                "name": unique_name(node.name),
+                "parent": parent_unique,
+                "matrix": node.location_matrix,
+                "extras": {
+                    "cad": {
+                        "role": "assembly" if node.is_assembly else "part",
+                        "part_id": node.part_id,
+                    }
+                },
+            }
+            if node.color:
+                result["color"] = list(node.color)
+            return result
 
-    while queue:
-        node, parent_name = queue.popleft()
-        node_data = process_node(node, parent_name)
-        node_map[node.part_id] = node_data
+        def mesh_node(node_data, shape):
+            if shape is None:
+                return
+            try:
+                pos, idx, nrm = _merged_mesh_buffers_for_shape(
+                    shape,
+                    linear_deflection,
+                    angular_deflection,
+                    remesh=True,
+                )
+                node_data["positions"] = pos
+                node_data["indices"] = idx
+                node_data["normals"] = nrm
+            except Exception as e:
+                print(f"Warning: failed to mesh {node_data['name']}: {e}", file=sys.stderr)
 
-        # 如果有 shape，添加几何数据
-        mesh_node(node_data, node.shape)
+        root_data = process_node(root, None)
+        node_map[root.part_id] = root_data
+        nodes.append(root_data)
+        mesh_node(root_data, root.shape)
 
-        nodes.append(node_data)
+        for child in root.children:
+            queue.append((child, root_data["name"]))
 
-        # 添加子节点到队列
-        current_unique = node_data["name"]  # use unique name for parent reference
-        for child in node.children:
-            queue.append((child, current_unique))
+        while queue:
+            node, parent_name = queue.popleft()
+            node_data = process_node(node, parent_name)
+            node_map[node.part_id] = node_data
+            mesh_node(node_data, node.shape)
+            nodes.append(node_data)
+            current_unique = node_data["name"]
+            for child in node.children:
+                queue.append((child, current_unique))
 
-    # 构建 scene_extras
-    hierarchy_meta = {
-        "schema": "robotlaser.step.hierarchy/v1",
-        "filename": filename,
-        "total_parts": len([n for n in nodes if n.get("positions")]),
-        "total_nodes": len(nodes),
-    }
+        hierarchy_meta = {
+            "schema": "robotlaser.step.hierarchy/v1",
+            "filename": filename,
+            "total_parts": len([n for n in nodes if n.get("positions")]),
+            "total_nodes": len(nodes),
+        }
 
-    # 生成 GLB
-    glb = hierarchical_scene_to_glb_bytes(
-        nodes,
-        scene_extras={"cad": hierarchy_meta},
-        root_name=root.name,
-    )
+        glb = hierarchical_scene_to_glb_bytes(
+            nodes,
+            scene_extras={"cad": hierarchy_meta},
+            root_name=root.name,
+        )
 
-    # 验证生成的 GLB 结构，防止输出无效的 glTF
+    # Validate generated GLB
     try:
         validate_glb_bytes(glb)
     except Exception as e:

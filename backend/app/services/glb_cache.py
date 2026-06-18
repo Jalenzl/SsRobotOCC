@@ -32,6 +32,7 @@ def _glb_key(
     angular_deflection: float,
     merge_faces: bool,
     mode: str,
+    per_face: bool = False,
 ) -> str:
     """Stable GLB cache key independent of the model_id format."""
     h = hashlib.sha256()
@@ -40,6 +41,7 @@ def _glb_key(
     h.update(f"|ad={angular_deflection:.6f}".encode())
     h.update(f"|merge={int(bool(merge_faces))}".encode())
     h.update(f"|mode={mode}".encode())
+    h.update(f"|per_face={int(bool(per_face))}".encode())
     return h.hexdigest()[:32]
 
 
@@ -56,6 +58,7 @@ def get_cached(
     angular_deflection: float,
     merge_faces: bool,
     mode: str,
+    per_face: bool = False,
 ) -> bytes | None:
     """Return the cached GLB bytes if fresh, else ``None``."""
     try:
@@ -71,6 +74,7 @@ def get_cached(
         angular_deflection=angular_deflection,
         merge_faces=merge_faces,
         mode=mode,
+        per_face=per_face,
     )
     glb_path = _glb_path(key)
     if not glb_path.is_file():
@@ -90,6 +94,7 @@ def put_cached(
     angular_deflection: float,
     merge_faces: bool,
     mode: str,
+    per_face: bool = False,
 ) -> None:
     """Store the generated GLB bytes; overwrites any prior entry."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -99,6 +104,7 @@ def put_cached(
         angular_deflection=angular_deflection,
         merge_faces=merge_faces,
         mode=mode,
+        per_face=per_face,
     )
     _glb_path(key).write_bytes(glb)
 

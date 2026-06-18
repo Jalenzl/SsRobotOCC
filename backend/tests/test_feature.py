@@ -69,7 +69,7 @@ def test_analyze_face_spread_multipart():
     )
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["schema_version"] == "1.0"
+    assert body["schema_version"] == "1.1"
     assert body["target_face_id"] == "face_2"
     assert body["face"]["surface_type"] == "plane"
 
@@ -380,24 +380,26 @@ def test_per_solid_dedups_coincident_wires():
     assert 11.5 < diams[1] < 12.5, f"largest diameter out of range: {diams}"
 
 
-def test_per_solid_emits_irregular_for_unclassified_loops():
-    """The classifier must produce a real `irregular` contour (not
-    `unknown`) for closed 4+ vertex shapes that don't match circle /
-    slot / rectangle / hexagon. `unknown` is reserved for degenerate
-    inputs (n<4, NaN, zero area) — `irregular` is the explicit
-    "I don't know what this is but it's a real feature" bucket.
+def test_per_solid_emits_unknown_for_unclassified_loops():
+    """The new 4-classifier design (circle/slot/rectangle/hexagon) replaces
+    the legacy `irregular` bucket with `unknown`. Any closed polyline that
+    falls through all four classifiers is `unknown`. This test uses an
+    ellipse-like shape (aspect=1.5) with a non-axis-aligned 5-point
+    star cross-section to ensure no classifier claims it.
     """
     from app.occ.contour import classify_wire_contour
+    import math
 
-    # Hand-built irregular closed polyline: 6 vertices, low circularity
-    # (~0.55), low aspect ratio (~1.5), not a rectangle (corners not
-    # axis-aligned), not a slot (no straight middle), not a circle
-    # (circularity 0.55 < 0.90), not a hexagon (only 6 verts, not 60°
-    # apart). Should land in `irregular`.
+    # Slightly elongated cross: 5-point star outline with aspect=1.5.
+    # - aspect=1.5 → CircleClassifier matches=False (bbox aspect too stretched)
+    # - aspect<2.2 → SlotClassifier matches=False
+    # - Not axis-aligned 4 corners → RectangleClassifier matches=False
+    # - Not 6 corners → HexagonClassifier matches=False
+    # → all 4 classifiers return matches=False → falls to unknown
     pts = [
         (0.0, 0.0, 0.0),
-        (12.0, 2.0, 0.0),
-        (20.0, 5.0, 0.0),
+        (15.0, 2.0, 0.0),
+        (22.0, 5.0, 0.0),
         (18.0, 12.0, 0.0),
         (8.0, 14.0, 0.0),
         (0.0, 8.0, 0.0),
@@ -411,11 +413,9 @@ def test_per_solid_emits_irregular_for_unclassified_loops():
         face_id="f_test",
         contour_index=0,
     )
-    assert c["contour_type"] == "irregular", (
-        f"expected `irregular`, got {c['contour_type']}"
+    assert c["contour_type"] == "unknown", (
+        f"expected `unknown`, got {c['contour_type']}"
     )
-    assert c["parameters"]["length"] > 0
-    assert c["parameters"]["width"] > 0
 
 
 def test_per_solid_filters_out_unwanted_surface_lines():

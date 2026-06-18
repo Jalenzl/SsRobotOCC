@@ -104,6 +104,8 @@ async def analyze_face_spread(
     request: Request,
     model_id: str | None = Form(default=None),
     face_id: str | None = Form(default=None),
+    part_id: str | None = Form(default=None),
+    analyze_mode: str | None = Form(default=None),
     options_json: str | None = Form(default=None),
     linear_deflection: float | None = Form(default=None),
     angular_deflection: float | None = Form(default=None),
@@ -113,18 +115,27 @@ async def analyze_face_spread(
     include_cylinder_holes: bool | None = Form(default=None),
     closure_tol: float | None = Form(default=None),
     enhanced_params: bool | None = Form(default=None),
+    target_face_id: str | None = Form(default=None),
 ) -> JSONResponse:
-    """Analyze the wires/contours/holes of a single face on a cached model.
+    """Analyze the wires/contours/holes of a single face or whole part on a cached model.
 
     Accepts ``multipart/form-data`` (frontend FormData) or ``application/json``
     (machine clients). Frontend posts::
 
         model_id = ...
-        face_id  = "face_12"  # or mesh name from GLB pick
+        face_id  = "face_12"  # 单面分析时传入 face ID
+        part_id  = "part_0"   # 整零件分析时传入 part ID
+        analyze_mode = "face" | "part"
         options_json = '{"linear_deflection":0.1,"work_plane":"auto",...}'
         enhanced_params = true  # Enable laser-software-style parameters
+
+    ``analyze_mode`` determines the analysis scope:
+    - "face" (default if face_id looks like a face): analyze one face
+    - "part" (default for part IDs / mesh names): analyze whole solid
+
+    ``target_face_id`` (part 模式): 只返回与该面法向对齐的同侧特征。
     """
-    if not (model_id and face_id):
+    if not (model_id and (face_id or part_id)):
         # Try JSON body if no form fields were supplied.
         try:
             payload = await request.json()
@@ -133,14 +144,17 @@ async def analyze_face_spread(
         if isinstance(payload, dict):
             model_id = model_id or payload.get("model_id")
             face_id = face_id or payload.get("face_id")
+            part_id = part_id or payload.get("part_id")
+            analyze_mode = analyze_mode or payload.get("analyze_mode")
+            target_face_id = target_face_id or payload.get("target_face_id")
             opts = _parse_options(payload.pop("options_json", None), payload)
         else:
             opts = {}
     else:
         opts = _parse_options(options_json, None)
 
-    if not (model_id and face_id):
-        raise HTTPException(status_code=400, detail="model_id and face_id are required")
+    if not (model_id and (face_id or part_id)):
+        raise HTTPException(status_code=400, detail="model_id and (face_id or part_id) are required")
 
     raw, name = _load_step(model_id)
 
@@ -153,19 +167,29 @@ async def analyze_face_spread(
     cyl = bool(opts.get("include_cylinder_holes", include_cylinder_holes if include_cylinder_holes is not None else False))
     ctl = float(opts.get("closure_tol", closure_tol if closure_tol is not None else 0.5))
     enh = bool(opts.get("enhanced_params", enhanced_params if enhanced_params is not None else False))
+    tfid = target_face_id or opts.get("target_face_id")
 
-    sel = _resolve_selector(str(face_id))
-    sel_lower = sel.lower()
-    is_part = sel_lower.startswith("part_")
-    # Treat anything that doesn't look like a face selector as a part
-    # name. The frontend often sends the GLB mesh name (e.g. "Assembly",
-    # "Part_<timestamp>", or the assembly partId) which is neither a
-    # numeric index nor a "face_<n>" tag. Forwarding those to part mode
-    # lets ``find_solid_by_id`` apply its single-solid fallback instead
-    # of returning a misleading "out of range" error.
-    looks_like_face = sel_lower.startswith("face_") or sel.isdigit()
-    if not is_part and not looks_like_face:
+    # ── 模式决策 ───────────────────────────────────────────────────────
+    # 优先级：analyze_mode 显式参数 > face_id 前缀判断
+    mode = (analyze_mode or "").strip().lower()
+    if mode == "face":
+        sel = _resolve_selector(str(face_id or part_id))
+        is_part = False
+    elif mode == "part":
+        raw_sel = part_id or face_id
+        sel = _resolve_selector(str(raw_sel))
+        if not sel.lower().startswith("part_"):
+            sel = f"part_{sel}" if sel.isdigit() else sel
         is_part = True
+    else:
+        # 兼容旧行为：按 ID 前缀自动判断
+        raw_sel = part_id or face_id
+        sel = _resolve_selector(str(raw_sel))
+        sel_lower = sel.lower()
+        is_part = sel_lower.startswith("part_")
+        if not is_part and not (sel_lower.startswith("face_") or sel.isdigit()):
+            sel = f"part_{sel}" if sel.isdigit() else sel
+            is_part = True
 
     try:
         if is_part:
@@ -182,6 +206,7 @@ async def analyze_face_spread(
                 include_cylinder_holes=cyl,
                 closure_tol=ctl,
                 enhanced_params=enh,
+                target_face_id=tfid,
             )
         else:
             result = feature_service.analyze_face_spread(

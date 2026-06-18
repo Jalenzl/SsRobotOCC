@@ -165,7 +165,12 @@ def cad_scene_to_glb_bytes(
     for d in drawables:
         name = d["name"]
         if name in node_names:
-            raise ValueError(f"duplicate drawable/node name: {name}")
+            # Auto-rename: append _1, _2, ... until unique.
+            base = name
+            n = 1
+            while name in node_names:
+                name = f"{base}_{n}"
+                n += 1
         parent = d.get("parent")
         node_names.add(name)
         if parent:
