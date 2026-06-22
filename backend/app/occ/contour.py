@@ -1051,10 +1051,20 @@ def find_face_by_id(shape: TopoDS_Shape, face_id: str) -> tuple[TopoDS_Face, str
     target_idx: int | None = None
     lower = fid.lower()
     if lower.startswith("face_"):
-        try:
-            target_idx = int(fid[5:])
-        except ValueError:
-            target_idx = None
+        suffix = fid[5:]
+        if "_" in suffix:
+            # Format: face_<global_idx>_<suffix> or face_<solid_idx>_<local_idx>
+            # Treat the first numeric segment as the global face index.
+            first = suffix.split("_")[0]
+            if first.isdigit():
+                target_idx = int(first)
+            else:
+                target_idx = None
+        else:
+            try:
+                target_idx = int(suffix)
+            except ValueError:
+                target_idx = None
     elif lower.startswith("part_"):
         from app.occ.topology import iter_solids
 

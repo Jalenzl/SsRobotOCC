@@ -90,12 +90,19 @@ def _parse_options(options_json: str | None, options_dict: dict | None) -> dict:
 
 
 def _resolve_selector(face_id: str) -> str:
-    """Normalise a face_id from frontend (face_<n>, part_<n>, bare int, ...)."""
+    """Normalise a face_id from frontend (face_<n>, face_<n>_<n>, part_<n>, bare int, ...)."""
     fid = (face_id or "").strip()
     if not fid:
         return fid
     if fid.isdigit():
         return f"face_{fid}"
+    # Handle compound IDs like face_78_4 — extract first numeric segment as global face index
+    lower = fid.lower()
+    if lower.startswith("face_"):
+        suffix = fid[5:]
+        first_num = suffix.split("_")[0]
+        if first_num.isdigit():
+            return f"face_{first_num}"
     return fid
 
 
@@ -182,8 +189,8 @@ async def analyze_face_spread(
             sel = f"part_{sel}" if sel.isdigit() else sel
         is_part = True
     else:
-        # 兼容旧行为：按 ID 前缀自动判断
-        raw_sel = part_id or face_id
+        # 兼容旧行为：face_id 优先走单面分析
+        raw_sel = face_id or part_id
         sel = _resolve_selector(str(raw_sel))
         sel_lower = sel.lower()
         is_part = sel_lower.startswith("part_")
