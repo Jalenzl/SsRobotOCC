@@ -669,6 +669,15 @@ def analyze_face(
     """Run the full wire → polyline → contour → hole pipeline on a single
     TopoDS_Face. Returns plain dict that matches ``CadFaceAnalyzeResult``.
     """
+    if _DEBUG_CLASSIFICATION:
+        import logging
+        _cl = logging.getLogger("contour")
+        if not _cl.handlers:
+            _h = logging.StreamHandler()
+            _h.setLevel(logging.DEBUG)
+            _h.setFormatter(logging.Formatter("[CONTOUR] %(message)s"))
+            _cl.addHandler(_h)
+        _cl.setLevel(logging.DEBUG)
     surf = face_surface_info(face)
     f_normal = face_outward_normal(face) or surf.get("normal")
     f_axis = surf.get("axis")
@@ -714,8 +723,10 @@ def analyze_face(
             "pts2d": _project_wire_points_2d(pts, tuple(f_normal) if f_normal else None),
         })
 
-    # 1b) drop coincident wires
-    wire_infos = _dedupe_wires(wire_infos)
+    # 1b) keep ALL wires (no dedup) — coincident wires on the same face
+    # may represent distinct design features (e.g. a stepped hole whose
+    # inner and outer rims share the same 3D loop in some STEP exports);
+    # deduping them silently drops features the user is expecting to see.
 
     # 1c) build polyline list from deduped wire set
     polylines = [
@@ -729,6 +740,15 @@ def analyze_face(
 
     # 2) outer / inner split using bbox containment
     closed_wires = [w for w in wire_infos if w["closed"] and (w["area"] or 0) > 0]
+    # ── DEBUG: 完整 wire 列表 ─────────────────────────────────────
+    import logging
+    logging.getLogger("contour").debug(
+        "[WIRES] face=%s all_wires=%s",
+        face_id,
+        [(w["id"], w.get("closed"), round(w.get("area") or 0.0, 4),
+          len(w.get("pts2d") or []))
+         for w in wire_infos],
+    )
     if closed_wires:
         bbox_by_id: dict[str, tuple[float, float, float, float]] = {}
         for w in closed_wires:
@@ -770,6 +790,15 @@ def analyze_face(
         for w in wire_infos:
             w["is_outer"] = (w["id"] == outer_id)
 
+        # ── DEBUG: outer 判定详细输出 ─────────────────────────────
+        import logging
+        logging.getLogger("contour").debug(
+            "[OUTER] face=%s closed_wires=%s outer_id=%s",
+            face_id,
+            [(w["id"], round(w.get("area") or 0.0, 4)) for w in closed_wires],
+            outer_id,
+        )
+
     # 3) classify each wire
     for ci, w in enumerate(wire_infos):
         contour = classify_wire_contour(
@@ -788,6 +817,16 @@ def analyze_face(
 
     # 3b) concentric-circle grouping
     _mark_concentric_rings(contours, face_id)
+
+    # ── DEBUG: 每条 wire 的分类结果 ──────────────────────────────
+    if _DEBUG_CLASSIFICATION:
+        import logging
+        for w, contour in zip(wire_infos, contours):
+            logging.getLogger("contour").debug(
+                "[CLASS] wire=%s -> contour=%s type=%s is_outer=%s area=%.4f",
+                w["id"], contour.get("id"), contour.get("contour_type"),
+                w.get("is_outer"), w.get("area") or 0.0,
+            )
 
     # 4) wires (post-classification)
     wires_out: list[dict] = []
