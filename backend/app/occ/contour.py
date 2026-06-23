@@ -316,13 +316,17 @@ def _mark_concentric_rings(
         if ra != rb:
             parent[rb] = ra
 
+    def _dist_3d(a, b) -> float:
+        """3D Euclidean distance between two centres."""
+        dx = a[0] - b[0]
+        dy = a[1] - b[1]
+        dz = (a[2] or 0.0) - (b[2] or 0.0)
+        return (dx * dx + dy * dy + dz * dz) ** 0.5
+
     for i in range(n):
         for j in range(i + 1, n):
-            ci = circles[i]["center"]
-            cj = circles[j]["center"]
-            dx = ci[0] - cj[0]
-            dy = ci[1] - cj[1]
-            if (dx * dx + dy * dy) ** 0.5 < centre_tol_mm:
+            dist = _dist_3d(circles[i]["center"], circles[j]["center"])
+            if dist < centre_tol_mm:
                 _union(i, j)
 
     clusters: dict[int, list[int]] = {}
@@ -335,18 +339,27 @@ def _mark_concentric_rings(
             continue
         members.sort(key=lambda i: _diameter(circles[i]))
         kept = members[0]
+        kept_diam = _diameter(circles[kept])
         for idx in members[1:]:
-            circles[idx]["contour_role"] = "concentric_ring"
+            ring_diam = _diameter(circles[idx])
+            # Only tag as concentric_ring if the ring is significantly larger
+            # than the kept hole (ratio > 1.3). Similar-size circles on the
+            # same face are treated as independent holes, not concentric rings.
+            if kept_diam > 0 and ring_diam / kept_diam > 1.3:
+                circles[idx]["contour_role"] = "concentric_ring"
             if _DEBUG_CLASSIFICATION:
                 import logging
 
+                dist = _dist_3d(circles[kept]["center"], circles[idx]["center"])
                 logging.getLogger("contour").debug(
-                    "concentric_ring: face=%s cid=%s diameter=%.4f tagged as ring (kept cid=%s d=%.4f)",
+                    "concentric_ring: face=%s cid=%s d=%.4f vs kept=%s d=%.4f dist3d=%.4f %s",
                     face_id,
                     circles[idx].get("id"),
-                    _diameter(circles[idx]),
+                    ring_diam,
                     circles[kept].get("id"),
-                    _diameter(circles[kept]),
+                    kept_diam,
+                    dist,
+                    "(ring)" if circles[idx].get("contour_role") == "concentric_ring" else "(kept as hole)",
                 )
 
 
@@ -857,6 +870,7 @@ def analyze_face(
             "slot",
             "rectangle",
             "hexagon",
+            "irregular",
             "unknown",
         ):
             _contour_to_hole(

@@ -24,18 +24,13 @@ from .base import ContourMetrics, ShapeClassifier
 
 # ── Thresholds ───────────────────────────────────────────────────────────────
 
-# Primary gate: arc-fit residual below 12% of the fitted radius.
-_ARC_FIT_REL_TOL = 0.12
+_ARC_FIT_REL_TOL = 0.02  # very tight — only true circles pass
 
-# Fallback: high raw circularity even if arc-fit is poor (e.g. a
-# near-perfect tessellation of a circle that confuses the
-# circumcenter-of-three heuristic).
-_CIRCULARITY_CIRCLE = 0.75
+
+_CIRCULARITY_CIRCLE = 0.90      # require near-perfect circularity
 _CIRCULARITY_CIRCLE_FALLBACK = 0.70
 
-# Ellipse disambiguation: the coefficient of variation of point
-# distances to the bbox centre distinguishes a true circle (CV < 0.05)
-# from an ellipse (CV > 0.10).
+
 _ELLIPSE_CV_THRESHOLD = 0.10
 _ELLIPSE_MIN_ASPECT = 1.05
 _ELLIPSE_MAX_ASPECT = 8.0
@@ -82,6 +77,24 @@ def _fit_circle_2d(pts2d: list[tuple[float, float]]) -> tuple[float, float, floa
         radii = [math.hypot(p[0] - cx, p[1] - cy) for p in pts2d]
         r_mean = sum(radii) / len(radii)
         var = sum((r - r_mean) ** 2 for r in radii) / (r_mean * r_mean + 1e-12)
+
+        # Validate: radius should be in a reasonable range
+        # Use bbox to determine expected size
+        xs = [p[0] for p in pts2d]
+        ys = [p[1] for p in pts2d]
+        bbox_diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        expected_size = bbox_diag / 2
+
+        # Radius should be within 0.1x to 5x of expected size
+        if r_mean < expected_size * 0.1 or r_mean > expected_size * 5:
+            continue
+        # Center should be within reasonable distance of bbox center
+        bbox_cx = (min(xs) + max(xs)) / 2
+        bbox_cy = (min(ys) + max(ys)) / 2
+        center_dist = math.hypot(cx - bbox_cx, cy - bbox_cy)
+        if center_dist > expected_size * 2:
+            continue
+
         if var < best_var:
             best_var = var
             best = (cx, cy, r_mean)
@@ -127,7 +140,7 @@ class CircleClassifier(ShapeClassifier):
 
     shape_name: ClassVar[str] = "circle"
     priority: ClassVar[int] = 100   # circle is the most "round" shape; test first
-    min_points: ClassVar[int] = 4
+    min_points: ClassVar[int] = 12  # must have enough points for meaningful arc-fit
 
     def matches(self, m: ContourMetrics) -> bool:
         if m.n < self.min_points or m.area_2d <= 0:

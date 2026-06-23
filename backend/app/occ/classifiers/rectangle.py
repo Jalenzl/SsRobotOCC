@@ -24,7 +24,7 @@ from .base import ContourMetrics, ShapeClassifier
 _RECT_ANGLE_TOL_DEG = 22.0      # interior corner tolerance
 _RECT_SIDE_RATIO_MIN = 0.20     # opposite sides must be ≥ 20% of each other
 _RECT_SIDE_RATIO_MAX = 1.25     # also reject very elongated squares (>1.25)
-_RECT_CIRCULARITY_MAX = 0.88    # must be less round than a near-circle (0.88 ≈ 40×12 rectangle)
+_RECT_CIRCULARITY_MAX = 0.83    # must be less round than a near-circle
 
 
 class RectangleClassifier(ShapeClassifier):
@@ -43,6 +43,11 @@ class RectangleClassifier(ShapeClassifier):
         # Reject near-circles early.
         if m.circularity > _RECT_CIRCULARITY_MAX:
             return False
+        # Reject shapes that are too close to a square (aspect ≈ 1)
+        # But allow low-point-count shapes (n < 10) to pass since they may be
+        # coarse tessellations of actual rectangles
+        if m.n >= 10 and m.aspect < 1.3:
+            return False
         return self._rect_geometry_ok(m)
 
     def _rect_geometry_ok(self, m: ContourMetrics) -> bool:
@@ -54,7 +59,7 @@ class RectangleClassifier(ShapeClassifier):
 
         # 1) Extract corners using perpendicular corner detection.
         corners = _extract_corners(pts2d, cx, cy)
-        if len(corners) != 4:
+        if len(corners) < 4:
             return False
 
         # 2) Check interior corner angles (each ≈ 90°).
@@ -163,6 +168,47 @@ def _extract_corners(
             (max(xs), max(ys)),
             (min(xs), max(ys)),
         ]
+
+    # Deduplicate corners that are essentially the same point
+    def _unique_by_dist(corners: list[tuple[float, float]], tol: float = 1e-4) -> list[tuple[float, float]]:
+        unique = []
+        for c in corners:
+            if not unique:
+                unique.append(c)
+            else:
+                is_dup = False
+                for u in unique:
+                    if abs(c[0] - u[0]) < tol and abs(c[1] - u[1]) < tol:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    unique.append(c)
+        return unique
+
+    raw = _unique_by_dist(raw)
+
+    # If we have exactly 4 bbox corners but they're not unique enough,
+    # check if the shape looks like a rectangle based on aspect ratio
+    # and circularity alone
+    if len(raw) < 4:
+        # Fallback: check if bbox aspect is reasonable for a rectangle
+        # and circularity is in the right range
+        xmin = min(p[0] for p in pts2d)
+        xmax = max(p[0] for p in pts2d)
+        ymin = min(p[1] for p in pts2d)
+        ymax = max(p[1] for p in pts2d)
+        w = xmax - xmin
+        h = ymax - ymin
+        aspect = max(w, h) / min(w, h) if min(w, h) > 1e-9 else float('inf')
+        # A square has aspect=1, a 2:1 rectangle has aspect=2
+        if 1.0 <= aspect <= 2.5:
+            # This looks like a square or modest rectangle - use bbox corners
+            raw = [
+                (xmin, ymin),
+                (xmax, ymin),
+                (xmax, ymax),
+                (xmin, ymax),
+            ]
 
     def polar(p: tuple[float, float]) -> float:
         return math.atan2(p[1] - cy, p[0] - cx)
