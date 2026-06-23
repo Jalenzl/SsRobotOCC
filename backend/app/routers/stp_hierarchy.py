@@ -388,6 +388,7 @@ def main():
         _merged_mesh_buffers_for_shape,
         shape_to_cad_drawables,
     )
+    from app.occ.geometry_utils import iterate_faces
     from app.utils.raw_glb import (
         hierarchical_scene_to_glb_bytes,
         cad_scene_to_glb_bytes,
@@ -408,6 +409,7 @@ def main():
         nodes: list[dict] = []
         used_names: dict[str, int] = {}
         queue: deque[tuple] = deque()
+        global_face_offset: int = 0  # 全局面索引偏移量
 
         def unique_name(name: str) -> str:
             count = used_names.get(name, 0)
@@ -431,7 +433,16 @@ def main():
                 result["color"] = list(node.color)
             return result
 
-        def add_shape_faces(shape, parent_group_name):
+        def count_shape_faces(shape) -> int:
+            # Count number of faces in a shape.
+            if shape is None:
+                return 0
+            try:
+                return sum(1 for _ in iterate_faces(shape))
+            except Exception:
+                return 0
+
+        def add_shape_faces(shape, parent_group_name, start_face_idx: int):
             # Expand shape faces into individual mesh drawables (parent = part group).
             if shape is None:
                 return
@@ -441,6 +452,7 @@ def main():
                     linear_deflection=linear_deflection,
                     angular_deflection=angular_deflection,
                     filename=filename,
+                    start_face_idx=start_face_idx,
                 )
                 for d in drawables:
                     nodes.append(d)
@@ -453,7 +465,8 @@ def main():
 
         # root itself may have a shape (e.g. plate_with_slot_100 where root.is_assembly=False)
         if root.shape is not None:
-            add_shape_faces(root.shape, root_data["name"])
+            add_shape_faces(root.shape, root_data["name"], global_face_offset)
+            global_face_offset += count_shape_faces(root.shape)
 
         # BFS traverse all child nodes
         for child in root.children:
@@ -465,7 +478,8 @@ def main():
             nodes.append(node_data)
 
             if node.shape is not None:
-                add_shape_faces(node.shape, node_data["name"])
+                add_shape_faces(node.shape, node_data["name"], global_face_offset)
+                global_face_offset += count_shape_faces(node.shape)
 
             for child in node.children:
                 queue.append((child, node_data["name"]))

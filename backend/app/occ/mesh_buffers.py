@@ -217,6 +217,8 @@ def shape_to_cad_drawables(
     linear_deflection: float = 0.1,
     angular_deflection: float = 0.5,
     filename: str = "model",
+    *,
+    start_face_idx: int = 0,
 ) -> tuple[list[CadGlbDrawable], list[dict[str, Any]], dict[str, list[str]]]:
     """
     Build hierarchical CAD drawables: per-face meshes + wire outlines + part grouping.
@@ -249,7 +251,7 @@ def shape_to_cad_drawables(
     parts_manifest: dict[str, list[str]] = {}
 
     for face_idx, face in enumerate(iterate_faces(shape)):
-        fid = f"face_{face_idx}"
+        fid = f"face_{start_face_idx + face_idx}"
         buffers = _face_mesh_buffers(face)
         if buffers is None:
             continue
@@ -433,6 +435,8 @@ def shape_to_glb_bytes(
     linear_deflection: float = 0.1,
     angular_deflection: float = 0.5,
     filename: str = "model",
+    *,
+    start_face_idx: int = 0,
 ) -> bytes:
     """Export hierarchical GLB: per-face meshes + wire outlines + STEP part grouping."""
     from app.utils.raw_glb import cad_scene_to_glb_bytes
@@ -442,6 +446,7 @@ def shape_to_glb_bytes(
         linear_deflection=linear_deflection,
         angular_deflection=angular_deflection,
         filename=filename,
+        start_face_idx=start_face_idx,
     )
 
     scene_extras = {
