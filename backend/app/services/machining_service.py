@@ -49,10 +49,11 @@ _DEFAULT_CRAFT_PARAMS: dict[str, CraftParameters] = {
 
 # ── Segment classification thresholds ─────────────────────────────────────────
 
-_LONG_LINE_RATIO = 0.4      # 长直线: 长度 > 周长 * 0.4
-_SHORT_LINE_RATIO = 0.1      # 短直线: 长度 > 周长 * 0.1
-_ARC_ANGLE_THRESHOLD = 30.0  # 圆弧角度阈值 (度)
-_CORNER_ANGLE_THRESHOLD = 60.0  # 拐角阈值 (度)
+_LONG_LINE_RATIO = 0.4      # 长直线: 长度 > 周长 * 0.4  
+_SHORT_LINE_RATIO = 0.1     # 短直线: 长度 > 周长 * 0.1  
+_ARC_ANGLE_THRESHOLD = 30.0 # 平面圆弧角度阈值 (度) — 用于把「3 点偏差」换算成角度, 大于该值视为大/小圆弧
+_CORNER_ANGLE_THRESHOLD = 60.0  # 段间夹角阈值 (度) — 大于该值视为三维拐角
+_POINT_LENGTH_TOL = 0.05     # 长度小于该值(mm)视为退化点 
 _LEAD_IN_LENGTH = 5.0        # 默认引线长度 (mm)
 _LEAD_IN_RADIUS = 2.0        # 默认引线圆弧半径 (mm)
 
@@ -228,88 +229,159 @@ def _generate_cam_lines_from_points(
 ) -> list[CAMLine]:
     """Generate CAMLines from a list of 3D points.
 
-    Classifies each segment as:
-    - Long line
-    - Short line
-    - Arc (large or small)
-    - Corner
+    每个段 (p[i-1] → p[i]) 按以下优先级判定 outType(对齐 C# ``OutPathType`` 枚举
+    的判定顺序,见 ``激光/MODELCORE/Products/Laser/CAMLine.cs`` 与
+    ``CraftRecipe.cs``):
+
+      1. ``point``           — 段长退化(近似重合点)
+      2. ``three_d_corner``  — 段间夹角 > 60°(三维拐角)
+      3. ``big_arc`` / ``small_arc`` — 段内 3 点垂直偏差换算成角度后 > 30°
+      4. ``long_line`` / ``shorter_line`` / ``shortest_line`` — 段长占周长比例分档
     """
     if len(points) < 2:
         return []
 
-    lines: list[CAMLine] = []
-
-    # Calculate total perimeter for segment classification
-    total_length = sum(
+    # Pre-compute segment lengths and total perimeter so the classifier
+    # only walks the polyline once.
+    seg_count = len(points) - 1
+    seg_lengths: list[float] = [
         math.sqrt(
-            (points[i][0] - points[i-1][0]) ** 2 +
-            (points[i][1] - points[i-1][1]) ** 2 +
-            (points[i][2] - points[i-1][2]) ** 2
+            (points[i][0] - points[i - 1][0]) ** 2
+            + (points[i][1] - points[i - 1][1]) ** 2
+            + (points[i][2] - points[i - 1][2]) ** 2
         )
         for i in range(1, len(points))
-    )
+    ]
+    total_length = sum(seg_lengths) or 1e-9
 
-    out_type_map: dict[str, OutPathTypeLiteral] = {
-        "long_line": "long_line",
-        "shorter_line": "shorter_line",
-        "shortest_line": "shortest_line",
-        "big_arc": "big_arc",
-        "small_arc": "small_arc",
-        "three_d_corner": "three_d_corner",
-        "point": "point",
-    }
+    lines: list[CAMLine] = []
 
     for i in range(1, len(points)):
         p1 = points[i - 1]
         p2 = points[i]
-        seg_length = math.sqrt(
-            (p2[0] - p1[0]) ** 2 +
-            (p2[1] - p1[1]) ** 2 +
-            (p2[2] - p1[2]) ** 2
+        seg_length = seg_lengths[i - 1]
+
+        out_type, velocity = _classify_segment(
+            i=i,
+            seg_count=seg_count,
+            p1=p1,
+            p2=p2,
+            seg_length=seg_length,
+            total_length=total_length,
+            points=points,
+            params=params,
         )
 
-        # Classify segment type
-        if seg_length > total_length * _LONG_LINE_RATIO:
-            out_type = OutPathType.LONG_LINE
-            velocity = params.velocity
-        elif seg_length > total_length * _SHORT_LINE_RATIO:
-            out_type = OutPathType.SHORTER_LINE
-            velocity = params.velocity * 0.8
-        else:
-            out_type = OutPathType.SHORTEST_LINE
-            velocity = params.velocity * 0.6
-
-        # Determine if segment is an arc (simplified: check if 3 consecutive points deviate from straight line)
-        if i > 0 and i < len(points) - 1:
-            p0 = points[i - 1]
-            p3 = points[i + 1]
-            deviation = _point_line_deviation(p2, p1, p3)
-            if deviation > 0.5:  # Significant deviation suggests arc
-                if deviation > 2.0:
-                    out_type = "big_arc"
-                else:
-                    out_type = "small_arc"
-                velocity = params.velocity * 0.7
-
-        line = CAMLine(
-            id=f"{path_id}_line_{i}",
-            line_type="machining",
-            path_type=path_type,
-            inner_type=inner_type,
-            out_type=out_type,
-            start_point=Point3D(root=p1),
-            end_point=Point3D(root=p2),
-            normal=normal,
-            velocity=velocity,
-            power=params.power,
-            duty=params.duty,
-            is_clockwise=True,  # Default, should be determined by contour direction
-            order_index=i,
-            robot_joints=[],
+        lines.append(
+            CAMLine(
+                id=f"{path_id}_line_{i}",
+                line_type="machining",
+                path_type=path_type,
+                inner_type=inner_type,
+                out_type=out_type,
+                start_point=Point3D(root=p1),
+                end_point=Point3D(root=p2),
+                normal=normal,
+                velocity=velocity,
+                power=params.power,
+                duty=params.duty,
+                is_clockwise=True,  # Default, should be determined by contour direction
+                order_index=i,
+                robot_joints=[],
+            )
         )
-        lines.append(line)
 
     return lines
+
+
+def _classify_segment(
+    *,
+    i: int,
+    seg_count: int,
+    p1: list[float],
+    p2: list[float],
+    seg_length: float,
+    total_length: float,
+    points: list[list[float]],
+    params: CraftParameters,
+) -> tuple[OutPathTypeLiteral, float]:
+    """Classify a single polyline segment into (out_type, velocity).
+
+    Mirrors the C# ``OutPathType`` decision tree (see
+    ``CAMLine.cs`` ``InitRobotPara`` dispatch and ``CraftRecipe.cs`` mapping).
+    Velocity stays as a ratio over ``params.velocity`` so the upstream
+    Pydantic schema is unchanged; the absolute mm/s values used by the
+    C# CraftRecipe layer are noted inline for reference.
+    """
+    # 1) Degenerate point — a segment shorter than the tolerance collapses
+    #    onto a single machining point (C# OutPathType.Point).
+    if seg_length < _POINT_LENGTH_TOL:
+        return "point", params.velocity * 0.5
+
+    # 2) Three-dimensional corner — the segment-to-segment angle exceeds
+    #    the corner threshold. This corresponds to OutPathType.ThreeDCorner
+    #    in C#; ``SmallThreeDCorner`` / ``PDLine`` (small step / slope
+    #    segments) require upstream face-edge topology which we don't
+    #    have here, so they remain unmapped.
+    if 0 < i < seg_count:
+        prev_seg = _vec_sub(points[i - 1], points[i - 2]) if i >= 2 else None
+        next_seg = _vec_sub(points[i + 1], points[i]) if i + 1 < len(points) else None
+        if prev_seg is not None and next_seg is not None:
+            angle = _angle_between(prev_seg, next_seg)
+            if angle > _CORNER_ANGLE_THRESHOLD:
+                # C# uses deg/s units here; we keep the velocity ratio
+                # convention by halving the baseline.
+                return "three_d_corner", params.velocity * 0.5
+
+    # 3) Planar arc — convert the existing 3-point deviation into an
+    #    equivalent angle (deviation ≈ seg_length * sin(theta)) and split
+    #    into big / small using _ARC_ANGLE_THRESHOLD. This is what the
+    #    C# WLineAnalyze uses to dispatch BigArc / SmallArc.
+    if 0 < i < seg_count:
+        prev_pt = points[i - 1]
+        next_pt = points[i + 1]
+        deviation = _point_line_deviation(p2, prev_pt, next_pt)
+        arc_angle = _deviation_to_angle(deviation, seg_length)
+        if arc_angle > _ARC_ANGLE_THRESHOLD:
+            # C# BigArc = 180 mm/s, SmallArc = 100 mm/s; we keep the
+            # ratio form (0.7 vs 0.5) so the upstream schema is stable.
+            return ("big_arc" if arc_angle > 2 * _ARC_ANGLE_THRESHOLD else "small_arc"), params.velocity * 0.7
+
+    # 4) Straight segment — bucket by length as a fraction of the
+    #    perimeter, matching C# LongLine / ShorterLine / ShortestLine.
+    if seg_length > total_length * _LONG_LINE_RATIO:
+        return "long_line", params.velocity
+    if seg_length > total_length * _SHORT_LINE_RATIO:
+        return "shorter_line", params.velocity * 0.8
+    return "shortest_line", params.velocity * 0.6
+
+
+def _vec_sub(a: list[float], b: list[float]) -> list[float]:
+    return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+
+
+def _angle_between(u: list[float], v: list[float]) -> float:
+    """Interior angle (degrees) between two vectors; 0..180."""
+    dot = u[0] * v[0] + u[1] * v[1] + u[2] * v[2]
+    nu = math.sqrt(u[0] ** 2 + u[1] ** 2 + u[2] ** 2)
+    nv = math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
+    if nu < 1e-9 or nv < 1e-9:
+        return 0.0
+    cos = max(-1.0, min(1.0, dot / (nu * nv)))
+    return math.degrees(math.acos(cos))
+
+
+def _deviation_to_angle(deviation: float, seg_length: float) -> float:
+    """Approximate the arc angle from a 3-point deviation.
+
+    deviation ≈ |seg_length| · sin(theta)  →  theta = asin(dev / seg_length)
+    Clamps to a sane upper bound so a degenerate (collinear) segment
+    doesn't report a 90° angle due to numerical noise.
+    """
+    if seg_length < 1e-9:
+        return 0.0
+    ratio = max(-1.0, min(1.0, deviation / seg_length))
+    return math.degrees(math.asin(ratio))
 
 """生成引线"""
 def _generate_lead_line(
@@ -379,10 +451,11 @@ def _point_line_deviation(
     a: list[float],
     b: list[float],
 ) -> float:
-    """Calculate perpendicular distance from point p to line segment ab.
+    """Perpendicular distance from point ``p`` to the line through ``a`` and ``b``.
 
-    This is used to detect if a point deviates from a straight line,
-    indicating a curved segment (arc).
+    Used by the arc branch of ``_classify_segment`` to detect curved
+    segments; ``_deviation_to_angle`` converts the result into an angle
+    which is then compared against ``_ARC_ANGLE_THRESHOLD``.
     """
     # Vector from a to b
     abx = b[0] - a[0]
