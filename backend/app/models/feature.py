@@ -190,36 +190,65 @@ class CAMLine(BaseModel):
 
 
 class MachiningPath(BaseModel):
-    """加工路径"""
+    """加工路径
+
+    语义：
+    - 单一 MachiningPath 对应一个**封闭加工单元**（一个外轮廓 / 一个孔 / 一段异形孔）
+    - `cam_lines` 列表顺序 = 加工顺序（每条 CAMLine = 起点→终点的一段加工动作）
+    - `lead_line` / `lead_out_line` = 引线 / 退刀线（单条 CAMLine，可选）
+    - `idle_lines` = 路径内不同 CAMLine 之间的过渡线（与跨 path 的空驶区别开）
+    - `source_hole_id` / `source_contour_id` = 该 path 关联的特征 ID（前端高亮用）
+    - `order_index` = 在所属 inner_paths / outer_paths 列表中的位置（=前端点击顺序）
+    """
     id: str
     name: str
     path_type: PathTypeLiteral = "outer"
     contour_id: str | None = None
     contour_type: str = "unknown"
+    source_hole_id: str | None = None
+    source_contour_id: str | None = None
     cam_lines: list[CAMLine] = Field(default_factory=list)
     lead_line: CAMLine | None = None
+    lead_out_line: CAMLine | None = None
     idle_lines: list[CAMLine] = Field(default_factory=list)
     thickness: float = 1.0
     normal_reversed: bool = False
     is_removed: bool = False
+    # 在所属 inner_paths / outer_paths 列表中的点击顺序
+    # 0-based，由后端在生成时按前端传入 hole_ids 顺序填入
+    order_index: int = 0
 
 
 class MachiningGroup(BaseModel):
-    """加工组"""
+    """加工组
+
+    `inner_paths` / `outer_paths` 列表顺序即为加工顺序；
+    `path_order` 是所有 path_id 按加工顺序的扁平序列，便于前端一次性还原。
+    """
     id: str
     name: str = "Default Group"
     inner_paths: list[MachiningPath] = Field(default_factory=list)
     outer_paths: list[MachiningPath] = Field(default_factory=list)
     process_face_ids: list[str] = Field(default_factory=list)
     is_merged: bool = False
+    # 按加工顺序排列的所有 path_id；前端用此序列驱动 3D 仿真播放
+    path_order: list[str] = Field(default_factory=list)
+    # 跨 path 之间的空驶线（idle/transition）；第一段的起点处无前置空驶
+    transition_lines: list[CAMLine] = Field(default_factory=list)
 
 
 class MachiningResult(BaseModel):
-    """加工分析结果 (包含特征识别 + CAM路径规划)"""
+    """加工分析结果 (包含特征识别 + CAM路径规划)
+
+    ``feature_result`` 允许是 ``dict``，以接受来自特征识别模块的原始
+    序列化结果（其内嵌的 ``points: list[Point3D]`` 可能尚未实例化）。
+    当前端直接消费 ``MachiningResult.model_dump()`` 输出时，这能避免
+    嵌套模型的强校验带来的额外开销。
+    """
     schema_version: str = "2.0"
     unit: str = "mm"
     model_id: str
-    feature_result: CadFaceAnalyzeResult | None = None
+    feature_result: Any | None = None
     machining_groups: list[MachiningGroup] = Field(default_factory=list)
     total_path_count: int = 0
     total_line_count: int = 0

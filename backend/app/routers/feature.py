@@ -42,6 +42,10 @@ def feature_status() -> dict:
             "POST /api/v1/cad/analyze/face_spread",
             "POST /api/v1/cad/analyze/part_spread",
             "POST /api/v1/cad/analyze/path",
+            "POST /api/v1/cad/machining/paths",
+            "POST /api/v1/cad/machining/paths/multi",
+            "GET  /api/v1/cad/machining/craft_params",
+            "GET  /api/v1/cad/machining/path_types",
             "GET  /api/v1/cad/faces",
             "GET  /api/v1/cad/parts",
         ],
@@ -550,6 +554,156 @@ def get_craft_params(
 
     params = get_craft_parameters_by_contour_type(contour_type, thickness)
     return JSONResponse(content=params.model_dump())
+
+
+# ── Multi-Hole Path Generation (with click-order preservation) ──────────────
+#
+# Front-end flow:
+#   1. User multi-selects holes on the 3D viewer (click / shift-click / drag)
+#   2. Front-end keeps an *ordered* list of hole_id in click sequence
+#   3. Front-end POSTs that list to this endpoint as JSON:
+#        { "model_id": "...", "face_id": "face_12", "hole_ids": ["hole_3","hole_1","hole_7"] }
+#   4. Backend generates one MachiningPath per hole in that order, plus
+#      cross-path idle (transit) lines; outer contours are optional.
+
+
+def _normalize_hole_ids(raw: Any) -> list[str]:
+    """Coerce a hole_ids payload (list / JSON string / None) to list[str]."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        # Accept JSON-array string or comma-separated fallback
+        s = raw.strip()
+        if not s:
+            return []
+        if s.startswith("["):
+            try:
+                parsed = json.loads(s)
+            except json.JSONDecodeError as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"hole_ids JSON 解析失败: {exc}"
+                ) from exc
+            if not isinstance(parsed, list):
+                raise HTTPException(status_code=400, detail="hole_ids 必须是列表")
+            return [str(x) for x in parsed]
+        return [tok.strip() for tok in s.split(",") if tok.strip()]
+    if isinstance(raw, list):
+        return [str(x) for x in raw]
+    raise HTTPException(status_code=400, detail=f"hole_ids 类型不支持: {type(raw).__name__}")
+
+
+@router.post("/machining/paths/multi")
+async def generate_machining_paths_multi(
+    request: Request,
+    model_id: str | None = Form(default=None),
+    face_id: str | None = Form(default=None),
+    part_id: str | None = Form(default=None),
+    hole_ids_json: str | None = Form(default=None),
+    include_outer: str | None = Form(default=None),
+    apply_craft_params: str | None = Form(default=None),
+    idle_velocity: str | None = Form(default=None),
+) -> JSONResponse:
+    """Generate CAM machining paths for a **user-selected set of holes** in
+    click order.
+
+    Differences from ``/machining/paths``:
+    - Accepts a JSON-serialised ``hole_ids`` list (click order is preserved)
+    - Optionally includes outer contours at the end (``include_outer=true``)
+    - Emits cross-path idle (transit) lines between adjacent holes
+    - Each ``MachiningPath`` carries ``order_index`` and ``source_hole_id``
+    - The ``MachiningGroup`` carries ``path_order`` (flat sequence) and
+      ``transition_lines`` (idle CAMLines)
+    """
+    from app.services.machining_service import generate_machining_paths_multi as _gen_paths_multi
+
+    # ── Parse request body (support both form and JSON) ────────────────────
+    payload: dict | None = None
+    if not (model_id and (face_id or part_id)):
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = None
+
+    if payload is not None:
+        model_id = model_id or payload.get("model_id")
+        face_id = face_id or payload.get("face_id")
+        part_id = part_id or payload.get("part_id")
+        # hole_ids: prefer direct list, else JSON string
+        if "hole_ids" in payload:
+            raw_ids = payload["hole_ids"]
+            if isinstance(raw_ids, str):
+                hole_ids = _normalize_hole_ids(raw_ids)
+            else:
+                hole_ids = _normalize_hole_ids(raw_ids)
+        else:
+            hole_ids = []
+        if "include_outer" in payload:
+            include_outer_flag = bool(payload["include_outer"])
+        else:
+            include_outer_flag = include_outer in ("1", "true", "True", "yes")
+        if "apply_craft_params" in payload:
+            apply_craft = bool(payload["apply_craft_params"])
+        else:
+            apply_craft = apply_craft_params not in ("0", "false", "False", "no")
+        if "idle_velocity" in payload:
+            try:
+                idle_v = float(payload["idle_velocity"])
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"idle_velocity 解析失败: {exc}"
+                ) from exc
+        else:
+            idle_v = None
+    else:
+        hole_ids = _normalize_hole_ids(hole_ids_json)
+        include_outer_flag = include_outer in ("1", "true", "True", "yes")
+        apply_craft = apply_craft_params not in ("0", "false", "False", "no")
+        try:
+            idle_v = float(idle_velocity) if idle_velocity is not None and idle_velocity != "" else None
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"idle_velocity 解析失败: {exc}"
+            ) from exc
+
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model_id is required")
+    if not (face_id or part_id):
+        raise HTTPException(status_code=400, detail="face_id or part_id is required")
+    if not hole_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="hole_ids is required and must be a non-empty list (click order)",
+        )
+
+    raw, name = _load_step(model_id)
+
+    try:
+        if part_id and (not face_id or part_id.lower().startswith("part_")):
+            feature_result = feature_service.analyze_part_spread(
+                step_bytes=raw, filename_hint=name, part_id=str(part_id),
+                hole_diameter_min=0.5, hole_diameter_max=500.0,
+                include_cylinder_holes=False, closure_tol=0.5,
+            )
+        else:
+            feature_result = feature_service.analyze_face_spread(
+                step_bytes=raw, filename_hint=name, face_id=str(face_id or part_id),
+                hole_diameter_min=0.5, hole_diameter_max=500.0,
+                include_cylinder_holes=False, closure_tol=0.5,
+            )
+
+        machining_result = _gen_paths_multi(
+            feature_result=feature_result,
+            hole_ids=hole_ids,
+            include_outer=include_outer_flag,
+            apply_craft_params=apply_craft,
+            idle_velocity=idle_v,
+        )
+        return JSONResponse(content=machining_result.model_dump())
+
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 @router.get("/machining/path_types")

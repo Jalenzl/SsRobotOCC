@@ -136,7 +136,63 @@ GET  /api/v1/stp/hierarchy/{model_id} → 使用缓存
 }
 ```
 
-## 6. CORS（跨域）
+## 6. CAM 路径规划（`/api/v1/cad/machining/...`）
+
+把特征识别结果转换为机器人可执行的"刀路"。**完整文档**见
+[`docs/machining.md`](./machining.md)；这里给出接口一览：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/v1/cad/machining/paths` | 单面所有孔洞 → 加工路径（保留兼容） |
+| POST | `/api/v1/cad/machining/paths/multi` | **多孔洞按点击顺序 → 加工路径** |
+| GET  | `/api/v1/cad/machining/craft_params` | 查询某类型轮廓的默认工艺 |
+| GET  | `/api/v1/cad/machining/path_types` | 枚举 path / line 类型 |
+
+### 6.1 `POST /api/v1/cad/machining/paths/multi`（推荐）
+
+多选孔洞时使用。**关键**：`hole_ids` 列表顺序就是加工顺序。
+
+```http
+POST /api/v1/cad/machining/paths/multi
+Content-Type: application/json
+
+{
+  "model_id":       "9f1c8b...",
+  "face_id":        "face_12",
+  "hole_ids":       ["hole_3", "hole_1", "hole_7"],
+  "include_outer":  false,
+  "idle_velocity":  350
+}
+```
+
+返回（精简）：
+
+```json
+{
+  "schema_version": "2.0",
+  "unit": "mm",
+  "model_id": "9f1c8b...",
+  "machining_groups": [{
+    "id": "group_xxx",
+    "name": "MultiHole[3]",
+    "inner_paths": [
+      { "id": "path_aaa", "name": "hole_circle", "order_index": 0, ... },
+      { "id": "path_bbb", "name": "hole_circle", "order_index": 1, ... },
+      { "id": "path_ccc", "name": "hole_hexagon","order_index": 2, ... }
+    ],
+    "path_order":       ["path_aaa", "path_bbb", "path_ccc"],
+    "transition_lines": [
+      { "line_type": "idle", "start_point": ..., "end_point": ..., "velocity": 350 }
+    ]
+  }],
+  "total_path_count": 3,
+  "total_line_count": 96
+}
+```
+
+> 配合方式、字段定义、错误码见 [`docs/machining.md`](./machining.md)。
+
+## 7. CORS（跨域）
 
 后端默认允许所有来源（`allow_origins=["*"]`）。生产环境在 `backend/.env` 配置：
 
@@ -145,7 +201,7 @@ CORS_ALLOW_ORIGINS=https://your-frontend.com,http://localhost:5173
 CORS_ALLOW_CREDENTIALS=true
 ```
 
-## 7. 后端启动（供外部联调）
+## 8. 后端启动（供外部联调）
 
 ```bat
 cd RobotLaserNew
